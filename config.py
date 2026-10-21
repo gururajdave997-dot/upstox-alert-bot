@@ -16,8 +16,11 @@ def _i(name, default):
 
 UPSTOX_API_KEY = os.getenv("UPSTOX_API_KEY", "").strip()
 UPSTOX_SECRET = os.getenv("UPSTOX_SECRET", "").strip()
-UPSTOX_REDIRECT_URI = os.getenv("UPSTOX_REDIRECT_URI", "").strip()
-ACCESS_TOKEN = os.getenv("ACCESS_TOKEN", "").strip()
+ACCESS_TOKEN = os.getenv("ACCESS_TOKEN", "").strip()  # optional; daily login via Telegram link
+_dom = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
+PUBLIC_URL = (os.getenv("PUBLIC_URL", "").strip() or (f"https://{_dom}" if _dom else "")).rstrip("/")
+REDIRECT_URI = os.getenv("UPSTOX_REDIRECT_URI", "").strip() or f"{PUBLIC_URL}/callback"
+PORT = int(os.getenv("PORT", "8080"))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
@@ -107,6 +110,7 @@ def parse_watchlist(raw):
 
 
 def missing_vars():
-    req = {"ACCESS_TOKEN": ACCESS_TOKEN, "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
-           "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID}
+    req = {"TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN, "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID,
+           "UPSTOX_API_KEY": UPSTOX_API_KEY, "UPSTOX_SECRET": UPSTOX_SECRET,
+           "PUBLIC_URL (generate a Railway domain)": PUBLIC_URL}
     return [k for k, v in req.items() if not v]

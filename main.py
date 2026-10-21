@@ -16,6 +16,7 @@ import strike_selector as S
 from data_feed import TokenExpired, UpstoxClient
 from live_feed import LiveFeed
 from positions import Tracker
+import web
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("main")
@@ -81,7 +82,12 @@ def fmt(sig, pid):
 
 class Bot:
     def __init__(self):
-        self.client = UpstoxClient(C.ACCESS_TOKEN)
+        self.store = web.TokenStore(os.path.join(C.STATE_DIR, "token.json"), C.ACCESS_TOKEN)
+        self.links = web.Links()
+        web.start(self.store, self.links)
+        self.client = UpstoxClient(self.store.get())
+        self.token_version = self.store.version
+        self.token_bad = not self.store.get()
         self.tracker = Tracker(os.path.join(C.STATE_DIR, "positions.json"))
         self.stocks = C.parse_watchlist(C.STOCK_WATCHLIST)
         self.indices = C.parse_watchlist(C.INDEX_WATCHLIST)
@@ -89,7 +95,6 @@ class Bot:
         self.index_keys = {k for k, _ in self.indices}
         self.live = None
         self.active = False
-        self.token_alerted = False
         self.last_scan = 0.0
         self.tg_offset = None
         self.day = None
@@ -135,10 +140,29 @@ class Bot:
                 feed = "live" if self.live and self.live.is_live() else "REST/idle"
                 notifier.send(f"Active: {self.active} · Feed: {feed} · "
                               f"Tracked: {len(self.tracker.pos)}")
+            elif cmd == "/login":
+                self.send_login("Login link")
             elif cmd == "/help":
-                notifier.send("/positions – tracked trades\n/close N – stop tracking #N\n/status")
+                notifier.send("/login – Upstox login link\n/positions – tracked trades\n"
+                              "/close N – stop tracking #N\n/status")
         if first and self.tg_offset is None:
             self.tg_offset = 0
+
+    def send_login(self, reason):
+        notifier.send(f"🔑 <b>{reason}</b>\n<a href=\"{self.links.new_link()}\">Tap here to log in "
+                      f"to Upstox</a> (valid 12h). The bot updates itself after login.")
+
+    def token_refresh(self):
+        """Pick up a new token saved by the login page."""
+        if self.store.version != self.token_version:
+            self.token_version = self.store.version
+            self.client.set_token(self.store.get())
+            self.token_bad = False
+            if self.live:
+                self.live.stop()
+                self.live = None
+            self.done.discard("live")
+            self.done.discard("tokcheck")
 
     # ---------- scans ----------
     def swing_scan(self, now):
@@ -210,7 +234,7 @@ class Bot:
 
     def start_live(self, now):
         keys = [k for k, _ in self.stocks + self.indices]
-        self.live = LiveFeed(C.ACCESS_TOKEN, keys)
+        self.live = LiveFeed(self.store.get(), keys)
         for key, _ in self.stocks + self.indices:
             try:
                 self.live.seed(key, self.client.candles(key, 1, now))
@@ -262,11 +286,14 @@ class Bot:
 
     def run(self):
         notifier.send("🤖 Upstox alert bot started. Send /help for commands.")
+        if self.token_bad:
+            self.send_login("Upstox login needed to start")
         while True:
             now = dt.datetime.now(IST)
             if now.date() != self.day:
                 self.reset_day(now.date())
             self.handle_commands()
+            self.token_refresh()
             in_window = now.weekday() < 5 and between(now, C.ACTIVE_START, C.ACTIVE_END)
             if not in_window:
                 if self.active:
@@ -281,13 +308,17 @@ class Bot:
                 notifier.send("✅ Scanner active. Watching for setups…")
                 self.active = True
             try:
+                if "tokcheck" not in self.done and not self.token_bad:
+                    self.done.add("tokcheck")
+                    self.client.check_token()
+                if self.token_bad:
+                    time.sleep(C.FAST_LOOP_SEC)
+                    continue
                 self.tick(now)
             except TokenExpired:
-                if not self.token_alerted:
-                    notifier.send("⚠️ <b>Upstox ACCESS_TOKEN expired/invalid.</b>\n"
-                                  "Run get_token.py and update ACCESS_TOKEN in Railway Variables.")
-                    self.token_alerted = True
-                time.sleep(300)
+                self.token_bad = True
+                self.send_login("Upstox token expired – please log in")
+                time.sleep(C.FAST_LOOP_SEC)
                 continue
             except Exception as e:
                 log.exception("Tick error: %s", e)

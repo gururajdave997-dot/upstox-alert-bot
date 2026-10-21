@@ -20,6 +20,12 @@ class UpstoxClient:
         self.s.headers.update({"Authorization": f"Bearer {token}", "Accept": "application/json"})
         self._cache = {}
 
+    def set_token(self, token):
+        self.s.headers["Authorization"] = f"Bearer {token}"
+
+    def check_token(self):
+        self._get("/v2/user/profile")
+
     def _get(self, path, params=None):
         r = self.s.get(BASE + path, params=params, timeout=15)
         if r.status_code == 401:
