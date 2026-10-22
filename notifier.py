@@ -36,3 +36,11 @@ def get_updates(offset=None):
         return r.json().get("result", []) if r.ok else []
     except Exception:
         return []
+
+
+def bot_username():
+    try:
+        r = requests.get(API.format(config.TELEGRAM_BOT_TOKEN, "getMe"), timeout=10)
+        return r.json()["result"].get("username", "") if r.ok else ""
+    except Exception:
+        return ""

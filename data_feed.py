@@ -75,9 +75,24 @@ class UpstoxClient:
             df = df.iloc[:-1]  # drop the still-forming candle
         return df
 
-    def daily(self, key, today):
-        """Completed daily candles up to yesterday (~400 days)."""
-        return self._hist(key, "day", today - dt.timedelta(days=1), today - dt.timedelta(days=400))
+    def daily(self, key, today, include_today=False):
+        """Completed daily candles up to yesterday (~400 days). include_today=True adds
+        today's candle built from 1-min data (use only after the market closes)."""
+        df = self._hist(key, "day", today - dt.timedelta(days=1), today - dt.timedelta(days=400))
+        if not include_today:
+            return df
+        data = self._get(f"/v2/historical-candle/intraday/{quote(key, safe='')}/1minute")
+        m = self._to_df(data.get("candles", []))
+        if m.empty:
+            return df
+        m = m[m.index.date == today]
+        if m.empty:
+            return df
+        row = pd.DataFrame({"open": [m["open"].iloc[0]], "high": [m["high"].max()],
+                            "low": [m["low"].min()], "close": [m["close"].iloc[-1]],
+                            "volume": [m["volume"].sum()]}, index=[m.index[0].normalize()])
+        out = pd.concat([df, row])
+        return out[~out.index.duplicated(keep="last")].sort_index()
 
     def nearest_expiry(self, key, today):
         k = ("exp", key, today)

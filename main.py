@@ -1,7 +1,10 @@
 """Orchestrator: swing scan (pre-market), intraday 5m, scalping 1m (live feed),
-options buy/sell setups, exit/trailing alerts, Telegram commands."""
+options buy/sell setups, exit/trailing alerts, Telegram commands.
+Runs as a GitHub Actions job: exits at end of day, or after MAX_RUNTIME_MIN so the
+workflow can start a fresh run (jobs are capped at 6 hours)."""
 import datetime as dt
 import html
+import json
 import logging
 import os
 import sys
@@ -10,13 +13,13 @@ import time
 import pytz
 
 import config as C
+import auth
 import notifier
 import strategy as ST
 import strike_selector as S
 from data_feed import TokenExpired, UpstoxClient
 from live_feed import LiveFeed
 from positions import Tracker
-import web
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("main")
@@ -82,9 +85,11 @@ def fmt(sig, pid):
 
 class Bot:
     def __init__(self):
-        self.store = web.TokenStore(os.path.join(C.STATE_DIR, "token.json"), C.ACCESS_TOKEN)
-        self.links = web.Links()
-        web.start(self.store, self.links)
+        self.store = auth.TokenStore(os.path.join(C.STATE_DIR, "token.bin"), C.ACCESS_TOKEN)
+        self.bot_user = notifier.bot_username()
+        self.session_path = os.path.join(C.STATE_DIR, "session.json")
+        self.started = time.time()
+        self.resumed = False
         self.client = UpstoxClient(self.store.get())
         self.token_version = self.store.version
         self.token_bad = not self.store.get()
@@ -96,6 +101,7 @@ class Bot:
         self.live = None
         self.active = False
         self.last_scan = 0.0
+        self.last_opt_scan = 0.0
         self.tg_offset = None
         self.day = None
 
@@ -104,6 +110,25 @@ class Bot:
         self.opt = {"buy": {}, "sell": {}, "iv": {}}
         self.chains, self.scalp_seen = {}, {}
         self.tracker.drop_stale_intraday(d)
+        try:  # carry today's alert memory over from the previous run (no duplicate alerts)
+            with open(self.session_path) as f:
+                ss = json.load(f)
+            if ss.get("day") == str(d):
+                self.sent = set(ss["sent"])
+                self.done = set(ss["done"]) - {"live", "tokcheck"}
+                self.opt = ss["opt"]
+                self.resumed = True
+        except Exception:
+            pass
+
+    def save_session(self):
+        try:
+            os.makedirs(C.STATE_DIR, exist_ok=True)
+            with open(self.session_path, "w") as f:
+                json.dump({"day": str(self.day), "sent": sorted(self.sent),
+                           "done": sorted(self.done), "opt": self.opt}, f)
+        except Exception as e:
+            log.warning("Could not save session: %s", e)
 
     # ---------- helpers ----------
     def emit(self, sig, now):
@@ -128,11 +153,16 @@ class Bot:
             m = u.get("message") or u.get("channel_post") or {}
             if str(m.get("chat", {}).get("id")) != C.TELEGRAM_CHAT_ID:
                 continue
-            parts = (m.get("text") or "").split()
+            text = m.get("text") or ""
+            parts = text.split()
+            if parts and "code=" in text and not parts[0].startswith("/"):
+                parts = ["/code", text]  # pasted the redirected URL directly
             if not parts or not parts[0].startswith("/"):
                 continue
             cmd = parts[0].split("@")[0].lower()
-            if cmd == "/positions":
+            if cmd in ("/start", "/code") and len(parts) > 1:
+                self.use_code(parts[1])
+            elif cmd == "/positions":
                 notifier.send(self.tracker.summary())
             elif cmd == "/close" and len(parts) > 1:
                 notifier.send(self.tracker.close(parts[1].lstrip("#")))
@@ -143,14 +173,26 @@ class Bot:
             elif cmd == "/login":
                 self.send_login("Login link")
             elif cmd == "/help":
-                notifier.send("/login – Upstox login link\n/positions – tracked trades\n"
+                notifier.send("/login – Upstox login link\n/code XXXX – finish login manually\n/positions – tracked trades\n"
                               "/close N – stop tracking #N\n/status")
         if first and self.tg_offset is None:
             self.tg_offset = 0
 
     def send_login(self, reason):
-        notifier.send(f"🔑 <b>{reason}</b>\n<a href=\"{self.links.new_link()}\">Tap here to log in "
-                      f"to Upstox</a> (valid 12h). The bot updates itself after login.")
+        notifier.send(f"🔑 <b>{reason}</b>\n<a href=\"{auth.login_url(self.bot_user)}\">Tap here to log in "
+                      f"to Upstox</a>.\nAfter login, tap <b>Start</b> when Telegram opens – or copy the "
+                      f"page address and send it here (or <code>/code XXXX</code>).")
+
+    def use_code(self, raw):
+        code = auth.extract_code(raw)
+        if not code:
+            return notifier.send("❌ Couldn't find a login code in that. Send /login to try again.")
+        try:
+            self.store.set(auth.exchange(code))
+            notifier.send("✅ Upstox login successful. Scanning with today's token.")
+        except Exception as e:
+            notifier.send(f"❌ Login failed: {html.escape(str(e))}\nSend /login for a fresh link "
+                          f"(codes work once and expire quickly).")
 
     def token_refresh(self):
         """Pick up a new token saved by the login page."""
@@ -165,11 +207,11 @@ class Bot:
             self.done.discard("tokcheck")
 
     # ---------- scans ----------
-    def swing_scan(self, now):
+    def swing_scan(self, now, eod=False):
         n = 0
         for key, name in self.swings:
             try:
-                sig = ST.swing_signal(self.client.daily(key, now.date()), name, key)
+                sig = ST.swing_signal(self.client.daily(key, now.date(), include_today=eod), name, key)
                 if sig:
                     n += 1
                     self.emit(sig, now)
@@ -177,7 +219,8 @@ class Bot:
                 raise
             except Exception as e:
                 log.warning("Swing %s: %s", name, e)
-        notifier.send(f"📅 Swing scan done: {n} setup(s) from {len(self.swings)} stocks.")
+        when = "Post-close" if eod else "Pre-market"
+        notifier.send(f"📅 {when} swing scan done: {n} setup(s) from {len(self.swings)} stocks.")
 
     def scalp_eval(self, key, name, df, now):
         if df is None or not len(df) or self.scalp_seen.get(key) == df.index[-1]:
@@ -204,6 +247,9 @@ class Bot:
                 raise
             except Exception as e:
                 log.warning("Stock scan %s: %s", name, e)
+        if time.time() - self.last_opt_scan < C.OPTIONS_SCAN_SEC:
+            return
+        self.last_opt_scan = time.time()
         for key, name in self.indices:
             try:
                 expiry = self.client.nearest_expiry(key, now.date())
@@ -262,6 +308,10 @@ class Bot:
         if C.ENABLE_SWING and "swing" not in self.done and now.time() >= T(C.SWING_SCAN_TIME):
             self.done.add("swing")
             self.swing_scan(now)
+        if C.ENABLE_SWING and C.SWING_EOD_TIME and "swing_eod" not in self.done \
+                and now.time() >= T(C.SWING_EOD_TIME):
+            self.done.add("swing_eod")
+            self.swing_scan(now, eod=True)
         if not between(now, C.MARKET_OPEN, C.MARKET_CLOSE):
             if self.live:
                 self.live.stop()
@@ -285,27 +335,40 @@ class Bot:
             self.scan(now)
 
     def run(self):
-        notifier.send("🤖 Upstox alert bot started. Send /help for commands.")
+        """Returns True if the workflow should start another run to continue today."""
+        now = dt.datetime.now(IST)
+        if not C.is_market_day(now.date()) or now.time() >= T(C.ACTIVE_END):
+            log.info("Market holiday/weekend or outside 08:00–17:00 window – nothing to do.")
+            return False
+        self.reset_day(now.date())
+        notifier.send("🔁 Bot resumed in a fresh GitHub run." if self.resumed
+                      else "🤖 Upstox alert bot started. Send /help for commands.")
         if self.token_bad:
             self.send_login("Upstox login needed to start")
+        try:
+            return self.loop()
+        finally:
+            if self.live:
+                self.live.stop()
+            self.save_session()
+
+    def loop(self):
         while True:
             now = dt.datetime.now(IST)
-            if now.date() != self.day:
-                self.reset_day(now.date())
+            if now.time() >= T(C.ACTIVE_END):
+                notifier.send("😴 Scan window closed for today.")
+                return False
+            if time.time() - self.started >= C.MAX_RUNTIME_MIN * 60:
+                log.info("Runtime limit reached – handing over to a new run.")
+                return True
             self.handle_commands()
             self.token_refresh()
-            in_window = now.weekday() < 5 and between(now, C.ACTIVE_START, C.ACTIVE_END)
-            if not in_window:
-                if self.active:
-                    notifier.send("😴 Scan window closed for today.")
-                    self.active = False
-                    if self.live:
-                        self.live.stop()
-                        self.live = None
+            if now.time() < T(C.ACTIVE_START):
                 time.sleep(30)
                 continue
             if not self.active:
-                notifier.send("✅ Scanner active. Watching for setups…")
+                if not self.resumed:
+                    notifier.send("✅ Scanner active. Watching for setups…")
                 self.active = True
             try:
                 if "tokcheck" not in self.done and not self.token_bad:
@@ -330,4 +393,8 @@ if __name__ == "__main__":
     if miss:
         log.error("Missing environment variables: %s", ", ".join(miss))
         sys.exit(1)
-    Bot().run()
+    cont = Bot().run()
+    out = os.getenv("GITHUB_OUTPUT")
+    if out:
+        with open(out, "a") as f:
+            f.write(f"continue={'true' if cont else 'false'}\n")

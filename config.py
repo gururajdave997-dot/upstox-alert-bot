@@ -1,5 +1,14 @@
-"""All settings come from environment variables (Railway > Variables)."""
+"""Settings come from environment variables: GitHub Secrets for keys, and an optional
+repo Variable BOT_SETTINGS (one KEY=VALUE per line) for everything else."""
 import os
+
+# GitHub passes unset secrets/vars as empty strings -> treat them as "not set"
+for _k in [k for k, v in os.environ.items() if not v.strip()]:
+    del os.environ[_k]
+for _line in os.getenv("BOT_SETTINGS", "").splitlines():
+    _k, _, _v = _line.partition("=")
+    if _k.strip() and not _k.strip().startswith("#") and _v.strip():
+        os.environ.setdefault(_k.strip(), _v.strip())
 
 
 def _b(name, default="true"):
@@ -17,10 +26,10 @@ def _i(name, default):
 UPSTOX_API_KEY = os.getenv("UPSTOX_API_KEY", "").strip()
 UPSTOX_SECRET = os.getenv("UPSTOX_SECRET", "").strip()
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN", "").strip()  # optional; daily login via Telegram link
-_dom = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
-PUBLIC_URL = (os.getenv("PUBLIC_URL", "").strip() or (f"https://{_dom}" if _dom else "")).rstrip("/")
-REDIRECT_URI = os.getenv("UPSTOX_REDIRECT_URI", "").strip() or f"{PUBLIC_URL}/callback"
-PORT = int(os.getenv("PORT", "8080"))
+# Must match the Redirect URL in your Upstox developer app exactly
+REDIRECT_URI = os.getenv("UPSTOX_REDIRECT_URI", "https://127.0.0.1/").strip()
+# GitHub jobs are capped at 6h, so each run stops after this and starts a fresh one
+MAX_RUNTIME_MIN = int(os.getenv("MAX_RUNTIME_MIN", "330"))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
@@ -44,7 +53,8 @@ ENABLE_EXIT_ALERTS = _b("ENABLE_EXIT_ALERTS")
 # Timings (IST, weekdays)
 ACTIVE_START = os.getenv("ACTIVE_START", "08:00")
 ACTIVE_END = os.getenv("ACTIVE_END", "17:00")
-SWING_SCAN_TIME = os.getenv("SWING_SCAN_TIME", "08:30")
+SWING_SCAN_TIME = os.getenv("SWING_SCAN_TIME", "08:30")      # pre-market: uses yesterday's close
+SWING_EOD_TIME = os.getenv("SWING_EOD_TIME", "15:40")        # after close: confirms on today's close ("" = off)
 MARKET_OPEN = os.getenv("MARKET_OPEN", "09:15")
 MARKET_CLOSE = os.getenv("MARKET_CLOSE", "15:30")
 ENTRY_START = os.getenv("ENTRY_START", "09:20")
@@ -52,7 +62,8 @@ NO_NEW_ENTRY_AFTER = os.getenv("NO_NEW_ENTRY_AFTER", "14:45")
 SELL_START = os.getenv("SELL_START", "09:45")
 SELL_END = os.getenv("SELL_END", "14:00")
 SQUARE_OFF_TIME = os.getenv("SQUARE_OFF_TIME", "15:15")
-SCAN_INTERVAL_SEC = _i("SCAN_INTERVAL_SEC", 60)
+SCAN_INTERVAL_SEC = _i("SCAN_INTERVAL_SEC", 60)   # intraday 5m + REST scalp fallback
+OPTIONS_SCAN_SEC = _i("OPTIONS_SCAN_SEC", 120)   # option chain refresh (OI changes slowly)
 FAST_LOOP_SEC = _i("FAST_LOOP_SEC", 5)
 
 # Intraday (5-min)
@@ -94,9 +105,27 @@ MIN_CREDIT_PCT = _f("MIN_CREDIT_PCT", 10)  # credit must be >= 10% of spread wid
 SELL_SL_PCT = _f("SELL_SL_PCT", 50)       # exit if spread value rises 50% above credit
 SELL_TARGET_PCT = _f("SELL_TARGET_PCT", 50)  # book when 50% of credit captured
 
+# NSE trading holidays (weekdays). Override/extend with MARKET_HOLIDAYS=YYYY-MM-DD,YYYY-MM-DD
+# 2026 list per NSE (via Upstox/Cleartax). Update every January from the NSE circular.
+NSE_HOLIDAYS_2026 = ("2026-01-26,2026-03-03,2026-03-26,2026-03-31,2026-04-03,2026-04-14,"
+                     "2026-05-01,2026-05-28,2026-06-26,2026-09-14,2026-10-02,2026-10-20,"
+                     "2026-11-10,2026-11-24,2026-12-25")
+MARKET_HOLIDAYS = {d.strip() for d in
+                   (NSE_HOLIDAYS_2026 + "," + os.getenv("MARKET_HOLIDAYS", "")).split(",") if d.strip()}
+# Special weekend sessions (e.g. Budget day, Muhurat) to run on: SPECIAL_SESSIONS=2026-11-08
+SPECIAL_SESSIONS = {d.strip() for d in os.getenv("SPECIAL_SESSIONS", "").split(",") if d.strip()}
+
+
+def is_market_day(d):
+    ds = d.isoformat()
+    if ds in SPECIAL_SESSIONS:
+        return True
+    return d.weekday() < 5 and ds not in MARKET_HOLIDAYS
+
+
 # Exit management
 TRAIL_R = _f("TRAIL_R", 1.0)  # trailing distance in multiples of initial risk
-STATE_DIR = os.getenv("STATE_DIR") or ("/data" if os.path.isdir("/data") else "./data")
+STATE_DIR = os.getenv("STATE_DIR", "data")  # saved between runs by the Actions cache
 
 
 def parse_watchlist(raw):
@@ -111,6 +140,5 @@ def parse_watchlist(raw):
 
 def missing_vars():
     req = {"TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN, "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID,
-           "UPSTOX_API_KEY": UPSTOX_API_KEY, "UPSTOX_SECRET": UPSTOX_SECRET,
-           "PUBLIC_URL (generate a Railway domain)": PUBLIC_URL}
+           "UPSTOX_API_KEY": UPSTOX_API_KEY, "UPSTOX_SECRET": UPSTOX_SECRET}
     return [k for k, v in req.items() if not v]

@@ -2,3 +2,4 @@ requests>=2.31
 pandas>=2.0
 pytz>=2024.1
 upstox-python-sdk>=2.30.0
+cryptography>=42
