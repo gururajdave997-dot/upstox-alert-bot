@@ -1,5 +1,6 @@
 """Upstox API v2 REST: candles, daily history, option chain, LTP."""
 import datetime as dt
+import time
 import logging
 from urllib.parse import quote
 
@@ -27,7 +28,11 @@ class UpstoxClient:
         self._get("/v2/user/profile")
 
     def _get(self, path, params=None):
-        r = self.s.get(BASE + path, params=params, timeout=15)
+        for wait in (1, 3, 10, 0):  # back off politely if Upstox rate-limits us (HTTP 429)
+            r = self.s.get(BASE + path, params=params, timeout=15)
+            if r.status_code != 429 or not wait:
+                break
+            time.sleep(wait)
         if r.status_code == 401:
             raise TokenExpired(r.text[:200])
         r.raise_for_status()
