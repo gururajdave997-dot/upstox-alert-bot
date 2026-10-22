@@ -215,6 +215,7 @@ class Bot:
                 if sig:
                     n += 1
                     self.emit(sig, now)
+                time.sleep(0.2)  # stay well inside Upstox API rate limits on big lists
             except TokenExpired:
                 raise
             except Exception as e:
