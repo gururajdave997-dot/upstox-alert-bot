@@ -1,1 +1,41 @@
-
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Upstox login</title>
+<style>
+  :root { --bg:#fff; --fg:#111; --box:#eef1f4; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#111; --fg:#eee; --box:#222; color-scheme: dark; } }
+  body { background:var(--bg); color:var(--fg); font-family:system-ui,sans-serif;
+         max-width:440px; margin:40px auto; padding:0 16px; text-align:center; }
+  code { display:block; font-size:22px; padding:14px; margin:14px 0; background:var(--box);
+         border-radius:8px; word-break:break-all; }
+  a, button { display:block; width:100%; box-sizing:border-box; padding:14px; margin:8px 0;
+              font-size:17px; border:0; border-radius:8px; background:#229ED9; color:#fff;
+              text-decoration:none; cursor:pointer; }
+</style>
+</head>
+<body>
+<h2 id="title">Upstox login</h2>
+<div id="box"></div>
+<script>
+  const q = new URLSearchParams(location.search);
+  const code = q.get("code") || "";
+  const bot = (q.get("state") || "").split(".")[0];
+  const box = document.getElementById("box");
+  if (!code) {
+    document.getElementById("title").textContent = "No login code";
+    box.innerHTML = "<p>Send /login to your Telegram bot for a new link.</p>";
+  } else {
+    const tg = /^[A-Za-z0-9_-]{1,64}$/.test(code) && bot ? `https://t.me/${bot}?start=${code}` : "";
+    box.innerHTML = `<p>Your code:</p><code>${code.replace(/[<>&]/g, "")}</code>` +
+      (tg ? `<a href="${tg}">Send to Telegram bot</a>` : "") +
+      `<button id="copy">Copy /code command</button>`;
+    document.getElementById("copy").onclick = () =>
+      navigator.clipboard.writeText("/code " + code).then(() => alert("Copied – paste it in Telegram"));
+    if (tg) location.href = tg;  // one tap: Telegram opens, press Start
+  }
+</script>
+</body>
+</html>
