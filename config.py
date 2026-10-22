@@ -128,13 +128,72 @@ TRAIL_R = _f("TRAIL_R", 1.0)  # trailing distance in multiples of initial risk
 STATE_DIR = os.getenv("STATE_DIR", "data")  # saved between runs by the Actions cache
 
 
+# Whole-index watchlists: write NIFTY50 / NIFTY100 / NIFTY200 / NIFTY500 (or several,
+# comma-separated, e.g. NIFTY50,NIFTYMIDCAP100) instead of listing stocks one by one.
+# The list is downloaded from NSE each run and cached in STATE_DIR as a fallback.
+INDEX_FILES = {
+    "NIFTY50": "ind_nifty50list.csv", "NIFTYNEXT50": "ind_niftynext50list.csv",
+    "NIFTY100": "ind_nifty100list.csv", "NIFTY200": "ind_nifty200list.csv",
+    "NIFTY500": "ind_nifty500list.csv", "NIFTYMIDCAP100": "ind_niftymidcap100list.csv",
+    "NIFTYSMALLCAP100": "ind_niftysmallcap100list.csv", "NIFTYBANK": "ind_niftybanklist.csv",
+}
+_INDEX_URLS = ("https://nsearchives.nseindia.com/content/indices/{}",
+               "https://www.niftyindices.com/IndexConstituent/{}",
+               "https://archives.nseindia.com/content/indices/{}")
+
+
+def _index_members(name):
+    import csv, io, logging
+    import requests
+    log = logging.getLogger("config")
+    fname = INDEX_FILES[name]
+    cache = os.path.join(STATE_DIR, fname)
+    text = ""
+    for url in _INDEX_URLS:
+        try:
+            r = requests.get(url.format(fname), timeout=20,
+                             headers={"User-Agent": "Mozilla/5.0", "Accept": "text/csv,*/*"})
+            if r.ok and "ISIN" in r.text[:300]:
+                text = r.text
+                os.makedirs(STATE_DIR, exist_ok=True)
+                with open(cache, "w") as f:
+                    f.write(text)
+                break
+        except Exception:
+            pass
+    if not text and os.path.exists(cache):
+        log.warning("%s download failed - using saved copy", name)
+        with open(cache) as f:
+            text = f.read()
+    if not text:
+        log.warning("%s list unavailable - skipped", name)
+        return []
+    rows = csv.DictReader(io.StringIO(text))
+    out = []
+    for r in rows:
+        r = {k.strip(): (v or "").strip() for k, v in r.items() if k}
+        isin, sym = r.get("ISIN Code", ""), r.get("Symbol", "")
+        if isin and sym:
+            out.append(f"NSE_EQ|{isin}:{sym}")
+    log.info("%s: %d stocks loaded", name, len(out))
+    return out
+
+
 def parse_watchlist(raw):
-    items = []
+    parts = []
+    for part in raw.split(","):
+        tag = part.strip().upper().replace(" ", "").replace("_", "")
+        parts.extend(_index_members(tag) if tag in INDEX_FILES else [part])
+    raw = ",".join(parts)
+    items, seen = [], set()
     for part in raw.split(","):
         part = part.strip()
         if part:
             key, _, name = part.rpartition(":")
-            items.append((key.strip(), name.strip()) if key else (name, name))
+            item = (key.strip(), name.strip()) if key else (name, name)
+            if item[0] not in seen:
+                seen.add(item[0])
+                items.append(item)
     return items
 
 
