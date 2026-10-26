@@ -1,5 +1,5 @@
 """Orchestrator: swing scan (pre-market), intraday 5m, scalping 1m (live feed),
-options buy/sell setups, exit/trailing alerts, Telegram commands.
+options buy/sell setups, exit/trailing alerts, Telegram commands, paper trading.
 Runs as a GitHub Actions job: exits at end of day, or after MAX_RUNTIME_MIN so the
 workflow can start a fresh run (jobs are capped at 6 hours)."""
 import datetime as dt
@@ -20,11 +20,13 @@ import strike_selector as S
 from data_feed import TokenExpired, UpstoxClient
 from live_feed import LiveFeed
 from positions import Tracker
+from paper_trade import PaperBook
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("main")
 IST = pytz.timezone("Asia/Kolkata")
 T = dt.time.fromisoformat
+PAPER_CHECK_SEC = 10  # how often paper trades are priced (keeps API calls low)
 
 
 def between(now, a, b):
@@ -94,6 +96,9 @@ class Bot:
         self.token_version = self.store.version
         self.token_bad = not self.store.get()
         self.tracker = Tracker(os.path.join(C.STATE_DIR, "positions.json"))
+        self.paper = PaperBook(os.path.join(C.STATE_DIR, "paper_trades.json"),
+                               T(C.SQUARE_OFF_TIME))
+        self.last_paper = 0.0
         self.stocks = C.parse_watchlist(C.STOCK_WATCHLIST)
         self.indices = C.parse_watchlist(C.INDEX_WATCHLIST)
         self.swings = C.parse_watchlist(C.SWING_WATCHLIST)
@@ -131,7 +136,7 @@ class Bot:
             log.warning("Could not save session: %s", e)
 
     # ---------- helpers ----------
-    def emit(self, sig, now):
+    def emit(self, sig, now, ikey=None):
         if not sig or sig["key"] in self.sent:
             return
         self.sent.add(sig["key"])
@@ -142,6 +147,50 @@ class Bot:
             notifier.send(m)
         log.info("SIGNAL %s", sig["key"])
         notifier.send(fmt(sig, pid))
+        self.paper_open(sig, ikey, now)
+
+    # ---------- paper trading (virtual money only, no real orders) ----------
+    def paper_open(self, sig, ikey, now):
+        if not self.paper.enabled:
+            return
+        try:
+            k = sig["kind"]
+            if k == "OPT_BUY":
+                p = sig.get("pick") or {}
+                ikey = p.get("instrument_key") or p.get("key")
+                name = f"{sig['symbol']} {p.get('strike')} {p.get('opt')}"
+                side, lot, ltp = "BUY", int(p.get("lot_size") or p.get("lot") or 1), sig["entry"]
+            elif k in ("SWING", "INTRADAY") or (k == "SCALP" and ikey not in self.index_keys):
+                name, lot = sig["symbol"], 1
+                side = "BUY" if sig["direction"] > 0 else "SELL"
+                ltp = None if k == "SWING" else sig["entry"]  # swing fills at next market open
+            else:
+                return  # index scalps and hedged option-sell spreads are not paper traded
+            if not ikey:
+                log.warning("Paper: no instrument key for %s, skipped", sig["key"])
+                return
+            msg = self.paper.open_trade(k, name, ikey, side, sig["sl"], sig["target"],
+                                        ltp=ltp, lot_size=lot, is_option=(k == "OPT_BUY"), now=now)
+            if msg:
+                notifier.send(msg)
+        except Exception as e:
+            log.warning("Paper open %s: %s", sig.get("key"), e)
+
+    def paper_check(self, now):
+        if time.time() - self.last_paper < PAPER_CHECK_SEC:
+            return
+        self.last_paper = time.time()
+        keys = self.paper.keys_needed()
+        if not keys:
+            return
+        px = {}
+        if self.live:
+            px = {k: v for k in keys if (v := self.live.ltp(k)) is not None}
+        missing = [k for k in keys if k not in px]
+        if missing:
+            px.update(self.client.ltp(missing))
+        for m in self.paper.update(px, now):
+            notifier.send(m)
 
     def handle_commands(self):
         ups = notifier.get_updates(self.tg_offset)
@@ -166,15 +215,26 @@ class Bot:
                 notifier.send(self.tracker.summary())
             elif cmd == "/close" and len(parts) > 1:
                 notifier.send(self.tracker.close(parts[1].lstrip("#")))
+            elif cmd == "/paper":
+                notifier.send(self.paper.positions_text())
+            elif cmd == "/pnl":
+                notifier.send(self.paper.pnl_text())
+            elif cmd == "/paperclose" and len(parts) > 1:
+                notifier.send(self.paper.remove(parts[1].lstrip("#")))
+            elif cmd == "/paperreset":
+                notifier.send(self.paper.reset())
             elif cmd == "/status":
                 feed = "live" if self.live and self.live.is_live() else "REST/idle"
                 notifier.send(f"Active: {self.active} · Feed: {feed} · "
-                              f"Tracked: {len(self.tracker.pos)}")
+                              f"Tracked: {len(self.tracker.pos)} · "
+                              f"Paper: {'ON' if self.paper.enabled else 'OFF'}")
             elif cmd == "/login":
                 self.send_login("Login link")
             elif cmd == "/help":
                 notifier.send("/login – Upstox login link\n/code XXXX – finish login manually\n/positions – tracked trades\n"
-                              "/close N – stop tracking #N\n/status")
+                              "/close N – stop tracking #N\n/status\n"
+                              "/paper – open paper trades\n/pnl – paper P&L\n"
+                              "/paperclose N – remove paper trade #N\n/paperreset – restart paper account")
         if first and self.tg_offset is None:
             self.tg_offset = 0
 
@@ -214,7 +274,7 @@ class Bot:
                 sig = ST.swing_signal(self.client.daily(key, now.date(), include_today=eod), name, key)
                 if sig:
                     n += 1
-                    self.emit(sig, now)
+                    self.emit(sig, now, key)
                 time.sleep(0.2)  # stay well inside Upstox API rate limits on big lists
             except TokenExpired:
                 raise
@@ -232,7 +292,7 @@ class Bot:
         if sig and is_idx and name in self.chains:
             cdf, ctx = self.chains[name]
             sig["pick"] = S.best_buy(cdf, "CE" if sig["direction"] > 0 else "PE", ctx["spot"])
-        self.emit(sig, now)
+        self.emit(sig, now, key)
 
     def scan(self, now):
         entries = between(now, C.ENTRY_START, C.NO_NEW_ENTRY_AFTER)
@@ -241,7 +301,7 @@ class Bot:
             try:
                 if C.ENABLE_INTRADAY and entries:
                     self.emit(ST.intraday_signal(self.client.candles(key, C.CANDLE_MINUTES, now),
-                                                 name, key), now)
+                                                 name, key), now, key)
                 if rest_scalp and entries:
                     self.scalp_eval(key, name, self.client.candles(key, 1, now), now)
             except TokenExpired:
@@ -323,6 +383,8 @@ class Bot:
             self.start_live(now)
         if C.ENABLE_EXIT_ALERTS:
             self.check_positions()
+        if self.paper.enabled:
+            self.paper_check(now)
         if "sq" not in self.done and now.time() >= T(C.SQUARE_OFF_TIME):
             self.done.add("sq")
             for m in self.tracker.square_off():
@@ -352,11 +414,15 @@ class Bot:
             if self.live:
                 self.live.stop()
             self.save_session()
+            if self.paper.enabled:
+                self.paper.save()
 
     def loop(self):
         while True:
             now = dt.datetime.now(IST)
             if now.time() >= T(C.ACTIVE_END):
+                if self.paper.enabled:
+                    notifier.send(self.paper.pnl_text(now))
                 notifier.send("😴 Scan window closed for today.")
                 return False
             if time.time() - self.started >= C.MAX_RUNTIME_MIN * 60:
