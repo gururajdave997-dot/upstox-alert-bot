@@ -10,7 +10,7 @@ Settings (add to BOT_SETTINGS, one per line):
   PAPER_COST_PCT=0.1        round-trip charges for stocks, % of turnover
   PAPER_OPTION_COST=60      flat round-trip charges per options trade (Rs)
 """
-import json, os, subprocess
+import json, os
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
@@ -26,11 +26,22 @@ def _settings():
         if "=" in line:
             k, v = line.split("=", 1)
             s[k.strip().upper()] = v.strip()
+    try:  # also accept values the bot's config module already parsed
+        import config
+        for k in ("PAPER_TRADING", "PAPER_CAPITAL", "PAPER_RISK_PCT", "PAPER_SLIPPAGE_PCT",
+                  "PAPER_COST_PCT", "PAPER_OPTION_COST"):
+            if k not in s and getattr(config, k, None) is not None:
+                s[k] = str(getattr(config, k))
+    except Exception:
+        pass
+    for k, v in os.environ.items():
+        if k.startswith("PAPER_") and k not in s:
+            s[k] = v
     return s
 
 
 class PaperBook:
-    def __init__(self, path=LEDGER_FILE):
+    def __init__(self, path=LEDGER_FILE, square_off=SQUARE_OFF):
         cfg = _settings()
         self.enabled = cfg.get("PAPER_TRADING", "OFF").upper() == "ON"
         self.start_capital = float(cfg.get("PAPER_CAPITAL", 500000))
@@ -38,6 +49,7 @@ class PaperBook:
         self.slip_pct = float(cfg.get("PAPER_SLIPPAGE_PCT", 0.05))
         self.cost_pct = float(cfg.get("PAPER_COST_PCT", 0.1))
         self.option_cost = float(cfg.get("PAPER_OPTION_COST", 60))
+        self.square_off = square_off
         self.path = path
         self.data = self._load()
 
@@ -49,26 +61,22 @@ class PaperBook:
         return {"capital": self.start_capital, "next_id": 1, "open": [], "closed": []}
 
     def save(self):
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         with open(self.path, "w") as f:
             json.dump(self.data, f, indent=1)
 
-    def commit(self):
-        """Push the ledger to GitHub so it survives the next run."""
-        self.save()
-        for cmd in (["git", "add", self.path],
-                    ["git", "commit", "-m", "paper ledger update"],
-                    ["git", "push"]):
-            subprocess.run(cmd, capture_output=True)
+    def keys_needed(self):
+        return list({t["ikey"] for t in self.data["open"]})
 
     # ---------- trades ----------
-    def open_trade(self, kind, symbol, side, sl, target, ltp=None,
+    def open_trade(self, kind, symbol, ikey, side, sl, target, ltp=None,
                    lot_size=1, is_option=False, now=None):
-        """Call when an alert fires. kind = SWING / INTRADAY / SCALP / OPTIONS.
+        """Call when an alert fires. ikey = Upstox instrument key whose price is tracked.
         Before 9:15 (or ltp=None) the trade waits and fills at the first live price."""
         if not self.enabled:
             return None
         now = now or datetime.now(IST)
-        t = {"id": self.data["next_id"], "kind": kind.upper(), "symbol": symbol,
+        t = {"id": self.data["next_id"], "kind": kind.upper(), "symbol": symbol, "ikey": ikey,
              "side": side.upper(), "sl": float(sl), "target": float(target),
              "lot": int(lot_size), "is_option": is_option, "pending": True,
              "alerted": now.isoformat(timespec="minutes")}
@@ -103,13 +111,13 @@ class PaperBook:
                 f"| SL {t['sl']} | Tgt {t['target']}")
 
     def update(self, prices, now=None):
-        """Call on every scan with {symbol: last_price}. Returns messages to send."""
+        """Call on every check with {instrument_key: last_price}. Returns messages to send."""
         if not self.enabled:
             return []
         now = now or datetime.now(IST)
         msgs = []
         for t in list(self.data["open"]):
-            ltp = prices.get(t["symbol"])
+            ltp = prices.get(t["ikey"])
             if ltp is None:
                 continue
             ltp = float(ltp)
@@ -129,7 +137,7 @@ class PaperBook:
                 reason = "SL hit"
             elif (buy and ltp >= t["target"]) or (not buy and ltp <= t["target"]):
                 reason = "Target hit"
-            elif t["kind"] != "SWING" and now.time() >= SQUARE_OFF:
+            elif t["kind"] != "SWING" and now.time() >= self.square_off:
                 reason = "3:15 PM square-off"
             if reason:
                 msgs.append(self._close(t, ltp, reason, now))
@@ -155,7 +163,7 @@ class PaperBook:
                 f"| Net Rs {net:,.0f} | Capital Rs {self.data['capital']:,.0f}")
 
     def remove(self, trade_id):
-        """Drop a trade with no P&L (matches the bot's /close N)."""
+        """Drop a trade with no P&L."""
         for t in self.data["open"]:
             if t["id"] == int(trade_id):
                 self.data["open"].remove(t)
@@ -191,7 +199,7 @@ class PaperBook:
         lines = ["📊 Paper trading P&L",
                  f"Today: {stats([r for r in closed if r['closed'].startswith(today)])}",
                  f"Overall: {stats(closed)}"]
-        for kind in ("SWING", "INTRADAY", "SCALP", "OPTIONS"):
+        for kind in ("SWING", "INTRADAY", "SCALP", "OPT_BUY"):
             rows = [r for r in closed if r["kind"] == kind]
             if rows:
                 lines.append(f"  {kind}: {stats(rows)}")
@@ -203,3 +211,4 @@ class PaperBook:
         self.data = {"capital": self.start_capital, "next_id": 1, "open": [], "closed": []}
         self.save()
         return "📝 Paper account reset."
+      
