@@ -20,6 +20,7 @@ class UpstoxClient:
         self.s = requests.Session()
         self.s.headers.update({"Authorization": f"Bearer {token}", "Accept": "application/json"})
         self._cache = {}
+        self.lots = {}  # option instrument_key -> lot size
 
     def set_token(self, token):
         self.s.headers["Authorization"] = f"Bearer {token}"
@@ -103,6 +104,9 @@ class UpstoxClient:
         k = ("exp", key, today)
         if k not in self._cache:
             data = self._get("/v2/option/contract", {"instrument_key": key}) or []
+            for c in data:
+                if c.get("instrument_key") and c.get("lot_size"):
+                    self.lots[c["instrument_key"]] = int(c["lot_size"])
             exps = sorted({c["expiry"] for c in data if c.get("expiry", "") >= today.isoformat()})
             if not exps:
                 raise RuntimeError(f"No expiries found for {key}")

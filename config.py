@@ -72,17 +72,32 @@ EMA_FAST = _i("EMA_FAST", 9)
 EMA_SLOW = _i("EMA_SLOW", 21)
 VOLUME_MULTIPLIER = _f("VOLUME_MULTIPLIER", 1.5)
 INTRADAY_RR = _f("INTRADAY_RR", 2.0)
+INTRA_MIN_RISK_PCT = _f("INTRA_MIN_RISK_PCT", 0.4)   # stop at least 0.4% away (costs need room)
+INTRA_MAX_RISK_PCT = _f("INTRA_MAX_RISK_PCT", 1.5)   # skip very wide, unclear setups
+INTRA_MAX_CANDLE_ATR = _f("INTRA_MAX_CANDLE_ATR", 1.8)  # skip if signal candle is overstretched
+INTRA_LAST_ENTRY = os.getenv("INTRA_LAST_ENTRY", "14:00")  # 1:2 needs time before 15:15
+MARKET_FILTER = _b("MARKET_FILTER")          # trade stocks only with NIFTY's 5-min trend
+MARKET_INDEX = os.getenv("MARKET_INDEX", "NIFTY")
 
 # Scalping (1-min)
 SCALP_EMA_FAST = _i("SCALP_EMA_FAST", 5)
 SCALP_EMA_SLOW = _i("SCALP_EMA_SLOW", 13)
 SCALP_ATR_SL = _f("SCALP_ATR_SL", 1.0)
-SCALP_ATR_TGT = _f("SCALP_ATR_TGT", 1.5)
+SCALP_ATR_TGT = _f("SCALP_ATR_TGT", 2.0)
+SCALP_MIN_ATR_PCT = _f("SCALP_MIN_ATR_PCT", 0.15)  # stock scalps only when 1-min ATR >= 0.15%
 
 # Swing (daily)
 SWING_LOOKBACK = _i("SWING_LOOKBACK", 20)
 SWING_ATR_SL = _f("SWING_ATR_SL", 2.0)
 SWING_RR = _f("SWING_RR", 2.0)
+# Cash shares cannot be shorted overnight in India. SELL swings are off unless you
+# trade them through F&O (futures / puts): SWING_SHORTS=ON
+SWING_SHORTS = _b("SWING_SHORTS", "false")
+SWING_REGIME_FILTER = _b("SWING_REGIME_FILTER")  # longs only if NIFTY > 50 DMA, shorts only below
+SWING_MAX_EXT_ATR = _f("SWING_MAX_EXT_ATR", 1.5)   # skip if close is > 1.5 ATR past breakout level
+SWING_CLOSE_LOC = _f("SWING_CLOSE_LOC", 0.6)       # buy: close in top 40% of day's range
+SWING_MIN_TURNOVER_CR = _f("SWING_MIN_TURNOVER_CR", 5)  # avg daily traded value, Rs crore
+SWING_MAX_DAYS = _i("SWING_MAX_DAYS", 15)          # time exit for swings that go nowhere
 
 # Options analysis
 STRIKES_AROUND_ATM = _i("STRIKES_AROUND_ATM", 5)
@@ -96,6 +111,9 @@ BUY_DELTA_MIN = _f("BUY_DELTA_MIN", 0.40)
 BUY_DELTA_MAX = _f("BUY_DELTA_MAX", 0.65)
 OPT_SL_PCT = _f("OPT_SL_PCT", 25)
 OPT_TARGET_PCT = _f("OPT_TARGET_PCT", 40)
+OPT_BUY_START = os.getenv("OPT_BUY_START", "09:45")   # OI change at 9:20 is mostly noise
+OPT_EXPIRY_CUTOFF = os.getenv("OPT_EXPIRY_CUTOFF", "13:00")  # no new buys on expiry day after this
+OPT_CONFIRM = _b("OPT_CONFIRM")   # OI bias must agree with the index's 5-min price trend
 # Option selling: best strike = OTM delta in this band, at/beyond OI wall, hedged
 SELL_DELTA_MIN = _f("SELL_DELTA_MIN", 0.15)
 SELL_DELTA_MAX = _f("SELL_DELTA_MAX", 0.30)

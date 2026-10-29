@@ -109,6 +109,8 @@ class Bot:
         self.last_opt_scan = 0.0
         self.tg_offset = None
         self.day = None
+        self.idx_bias = {}   # index name -> +1/-1/0 from 5-min trend
+        self.swing_seen_path = os.path.join(C.STATE_DIR, "swing_seen.json")
 
     def reset_day(self, d):
         self.day, self.sent, self.done = d, set(), set()
@@ -163,7 +165,8 @@ class Bot:
             elif k in ("SWING", "INTRADAY") or (k == "SCALP" and ikey not in self.index_keys):
                 name, lot = sig["symbol"], 1
                 side = "BUY" if sig["direction"] > 0 else "SELL"
-                ltp = None if k == "SWING" else sig["entry"]  # swing fills at next market open
+                live_px = self.live.ltp(ikey) if self.live and k != "SWING" else None
+                ltp = None if k == "SWING" else (live_px or sig["entry"])  # swing: next open
             else:
                 return  # index scalps and hedged option-sell spreads are not paper traded
             if not ikey:
@@ -215,6 +218,13 @@ class Bot:
                 notifier.send(self.tracker.summary())
             elif cmd == "/close" and len(parts) > 1:
                 notifier.send(self.tracker.close(parts[1].lstrip("#")))
+            elif cmd == "/closeall":
+                kind = parts[1].upper() if len(parts) > 1 else None
+                ids = [pid for pid, p in self.tracker.pos.items() if not kind or p["kind"] == kind]
+                for pid in ids:
+                    self.tracker.pos.pop(pid)
+                self.tracker._save()
+                notifier.send(f"✖️ Stopped tracking {len(ids)} position(s)")
             elif cmd == "/paper":
                 notifier.send(self.paper.positions_text())
             elif cmd == "/pnl":
@@ -232,7 +242,7 @@ class Bot:
                 self.send_login("Login link")
             elif cmd == "/help":
                 notifier.send("/login – Upstox login link\n/code XXXX – finish login manually\n/positions – tracked trades\n"
-                              "/close N – stop tracking #N\n/status\n"
+                              "/close N – stop tracking #N\n/closeall [SWING] – stop tracking all\n/status\n"
                               "/paper – open paper trades\n/pnl – paper P&L\n"
                               "/paperclose N – remove paper trade #N\n/paperreset – restart paper account")
         if first and self.tg_offset is None:
@@ -267,12 +277,33 @@ class Bot:
             self.done.discard("tokcheck")
 
     # ---------- scans ----------
+    def _swing_seen(self):
+        try:
+            with open(self.swing_seen_path) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
     def swing_scan(self, now, eod=False):
         n = 0
+        regime = 0
+        mk = next((k for k, nm in self.indices if nm == C.MARKET_INDEX), None)
+        if mk:
+            try:
+                regime = ST.daily_regime(self.client.daily(mk, now.date(), include_today=eod))
+            except TokenExpired:
+                raise
+            except Exception as e:
+                log.warning("Regime: %s", e)
+        seen = self._swing_seen()  # same daily candle is seen by 15:40 scan and next 8:30 scan
+        cutoff = (now.date() - dt.timedelta(days=7)).isoformat()
+        seen = {k: v for k, v in seen.items() if v >= cutoff}
         for key, name in self.swings:
             try:
-                sig = ST.swing_signal(self.client.daily(key, now.date(), include_today=eod), name, key)
-                if sig:
+                sig = ST.swing_signal(self.client.daily(key, now.date(), include_today=eod),
+                                      name, key, regime)
+                if sig and sig["key"] not in seen:
+                    seen[sig["key"]] = now.date().isoformat()
                     n += 1
                     self.emit(sig, now, key)
                 time.sleep(0.2)  # stay well inside Upstox API rate limits on big lists
@@ -280,15 +311,22 @@ class Bot:
                 raise
             except Exception as e:
                 log.warning("Swing %s: %s", name, e)
+        try:
+            with open(self.swing_seen_path, "w") as f:
+                json.dump(seen, f)
+        except Exception:
+            pass
         when = "Post-close" if eod else "Pre-market"
-        notifier.send(f"📅 {when} swing scan done: {n} setup(s) from {len(self.swings)} stocks.")
+        reg = {1: "NIFTY above 50 DMA", -1: "NIFTY below 50 DMA"}.get(regime, "regime n/a")
+        notifier.send(f"📅 {when} swing scan done: {n} setup(s) from {len(self.swings)} stocks "
+                      f"({reg}).")
 
     def scalp_eval(self, key, name, df, now):
         if df is None or not len(df) or self.scalp_seen.get(key) == df.index[-1]:
             return
         self.scalp_seen[key] = df.index[-1]
         is_idx = key in self.index_keys
-        sig = ST.scalp_signal(df, name, key, is_idx)
+        sig = ST.scalp_signal(df, name, key, is_idx, self.idx_bias.get(C.MARKET_INDEX, 0))
         if sig and is_idx and name in self.chains:
             cdf, ctx = self.chains[name]
             sig["pick"] = S.best_buy(cdf, "CE" if sig["direction"] > 0 else "PE", ctx["spot"])
@@ -297,11 +335,19 @@ class Bot:
     def scan(self, now):
         entries = between(now, C.ENTRY_START, C.NO_NEW_ENTRY_AFTER)
         rest_scalp = C.ENABLE_SCALP and not (self.live and self.live.is_live())
+        for key, name in self.indices:  # index trend = filter for stocks and option buys
+            try:
+                self.idx_bias[name] = ST.trend_bias(self.client.candles(key, C.CANDLE_MINUTES, now))
+            except TokenExpired:
+                raise
+            except Exception as e:
+                log.warning("Bias %s: %s", name, e)
+        mkt = self.idx_bias.get(C.MARKET_INDEX, 0)
         for key, name in self.stocks:
             try:
                 if C.ENABLE_INTRADAY and entries:
                     self.emit(ST.intraday_signal(self.client.candles(key, C.CANDLE_MINUTES, now),
-                                                 name, key), now, key)
+                                                 name, key, mkt), now, key)
                 if rest_scalp and entries:
                     self.scalp_eval(key, name, self.client.candles(key, 1, now), now)
             except TokenExpired:
@@ -321,11 +367,18 @@ class Bot:
                 self.chains[name] = (cdf, ctx)
                 if rest_scalp and entries:
                     self.scalp_eval(key, name, self.client.candles(key, 1, now), now)
-                if C.ENABLE_OPTIONS_BUY and entries:
+                late_expiry = expiry == now.date().isoformat() and \
+                    now.time() >= T(C.OPT_EXPIRY_CUTOFF)
+                if C.ENABLE_OPTIONS_BUY and entries and not late_expiry \
+                        and now.time() >= T(C.OPT_BUY_START):
                     prev = self.opt["buy"].get(name)
-                    self.opt["buy"][name] = ctx["bias"]
                     if ctx["bias"] != prev:
-                        self.emit(ST.options_buy_setup(cdf, ctx), now)
+                        sig = ST.options_buy_setup(cdf, ctx, self.idx_bias.get(name, 0))
+                        if sig or ctx["bias"] == "NEUTRAL":
+                            self.opt["buy"][name] = ctx["bias"]  # else retry until price agrees
+                        if sig:
+                            sig["pick"]["lot_size"] = self.client.lots.get(sig["pick"]["key"], 1)
+                        self.emit(sig, now)
                 if C.ENABLE_OPTIONS_SELL and between(now, C.SELL_START, C.SELL_END):
                     prev = self.opt["sell"].get(name)
                     self.opt["sell"][name] = ctx["bias"]

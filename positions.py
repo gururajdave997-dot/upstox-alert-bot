@@ -1,5 +1,6 @@
 """Tracks alerted trades and sends exit alerts: SL, breakeven, target, trailing SL,
 opposite signal, spot breach (spreads), and intraday square-off. Saved to JSON."""
+import datetime as dt
 import html
 import json
 import logging
@@ -103,6 +104,13 @@ class Tracker:
                 continue
             v = round(v, 2)
             f, lab = p["fav"], self._label(p)
+            if not p["intraday"]:
+                age = (dt.date.today() - dt.date.fromisoformat(p["opened"][:10])).days
+                if age >= C.SWING_MAX_DAYS:
+                    msgs.append(f"⌛ <b>EXIT {lab}</b> – no result in {C.SWING_MAX_DAYS} days "
+                                f"@ {v} ({self._pnl(p, v)}). Free the capital.")
+                    del self.pos[pid]
+                    continue
             g = p.get("guard")
             if g and px.get(g["key"]) is not None:
                 s = px[g["key"]]
