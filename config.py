@@ -44,7 +44,8 @@ SWING_WATCHLIST = os.getenv("SWING_WATCHLIST", "") or STOCK_WATCHLIST
 
 # Modules on/off
 ENABLE_INTRADAY = _b("ENABLE_INTRADAY")
-ENABLE_SCALP = _b("ENABLE_SCALP")
+ENABLE_OPTIONS_SWING = _b("ENABLE_OPTIONS_SWING")   # positional index option buys
+ENABLE_LIVE_FEED = _b("ENABLE_LIVE_FEED")   # WebSocket prices for faster exit alerts
 ENABLE_SWING = _b("ENABLE_SWING")
 ENABLE_OPTIONS_BUY = _b("ENABLE_OPTIONS_BUY")
 ENABLE_OPTIONS_SELL = _b("ENABLE_OPTIONS_SELL")
@@ -62,7 +63,7 @@ NO_NEW_ENTRY_AFTER = os.getenv("NO_NEW_ENTRY_AFTER", "14:45")
 SELL_START = os.getenv("SELL_START", "09:45")
 SELL_END = os.getenv("SELL_END", "14:00")
 SQUARE_OFF_TIME = os.getenv("SQUARE_OFF_TIME", "15:15")
-SCAN_INTERVAL_SEC = _i("SCAN_INTERVAL_SEC", 60)   # intraday 5m + REST scalp fallback
+SCAN_INTERVAL_SEC = _i("SCAN_INTERVAL_SEC", 60)   # intraday 5m scan
 OPTIONS_SCAN_SEC = _i("OPTIONS_SCAN_SEC", 120)   # option chain refresh (OI changes slowly)
 FAST_LOOP_SEC = _i("FAST_LOOP_SEC", 5)
 
@@ -78,13 +79,17 @@ INTRA_MAX_CANDLE_ATR = _f("INTRA_MAX_CANDLE_ATR", 1.8)  # skip if signal candle 
 INTRA_LAST_ENTRY = os.getenv("INTRA_LAST_ENTRY", "14:00")  # 1:2 needs time before 15:15
 MARKET_FILTER = _b("MARKET_FILTER")          # trade stocks only with NIFTY's 5-min trend
 MARKET_INDEX = os.getenv("MARKET_INDEX", "NIFTY")
-
-# Scalping (1-min)
-SCALP_EMA_FAST = _i("SCALP_EMA_FAST", 5)
-SCALP_EMA_SLOW = _i("SCALP_EMA_SLOW", 13)
-SCALP_ATR_SL = _f("SCALP_ATR_SL", 1.0)
-SCALP_ATR_TGT = _f("SCALP_ATR_TGT", 2.0)
-SCALP_MIN_ATR_PCT = _f("SCALP_MIN_ATR_PCT", 0.15)  # stock scalps only when 1-min ATR >= 0.15%
+# Intraday setups: ORB (opening-range breakout), PULLBACK (to EMA21/VWAP in a trend), CROSS
+INTRA_SETUPS = {x.strip().upper() for x in os.getenv("INTRA_SETUPS", "ORB,PULLBACK,CROSS").split(",")}
+ORB_MINUTES = _i("ORB_MINUTES", 15)                  # opening range = first 15 min
+ORB_LAST_ENTRY = os.getenv("ORB_LAST_ENTRY", "11:30")
+ORB_MAX_WIDTH_PCT = _f("ORB_MAX_WIDTH_PCT", 1.2)     # skip if opening range is too wide
+PULLBACK_VOL_MULT = _f("PULLBACK_VOL_MULT", 1.2)     # pullback resumption needs less volume
+INTRA_MIN_ADX = _f("INTRA_MIN_ADX", 18)              # skip choppy charts (CROSS / PULLBACK)
+INTRA_HTF_FILTER = _b("INTRA_HTF_FILTER")            # 15-min trend must agree
+INTRA_RS_FILTER = _b("INTRA_RS_FILTER")              # longs outperform NIFTY today, shorts lag
+INTRA_RSI_MAX = _f("INTRA_RSI_MAX", 72)              # no longs above / shorts below (100-x)
+INTRA_MAX_PER_STOCK = _i("INTRA_MAX_PER_STOCK", 2)   # alerts per stock per day
 
 # Swing (daily)
 SWING_LOOKBACK = _i("SWING_LOOKBACK", 20)
@@ -98,6 +103,11 @@ SWING_MAX_EXT_ATR = _f("SWING_MAX_EXT_ATR", 1.5)   # skip if close is > 1.5 ATR 
 SWING_CLOSE_LOC = _f("SWING_CLOSE_LOC", 0.6)       # buy: close in top 40% of day's range
 SWING_MIN_TURNOVER_CR = _f("SWING_MIN_TURNOVER_CR", 5)  # avg daily traded value, Rs crore
 SWING_MAX_DAYS = _i("SWING_MAX_DAYS", 15)          # time exit for swings that go nowhere
+# Swing setups: BREAKOUT (20-day high) and PULLBACK (dip to 20 EMA in an uptrend, then reversal)
+SWING_SETUPS = {x.strip().upper() for x in os.getenv("SWING_SETUPS", "BREAKOUT,PULLBACK").split(",")}
+SWING_RS_FILTER = _b("SWING_RS_FILTER")            # stock must beat NIFTY over SWING_RS_DAYS
+SWING_RS_DAYS = _i("SWING_RS_DAYS", 63)            # ~3 months
+SWING_OPTION_ALT = _b("SWING_OPTION_ALT")          # also suggest a monthly CE for F&O stocks
 
 # Options analysis
 STRIKES_AROUND_ATM = _i("STRIKES_AROUND_ATM", 5)
@@ -109,8 +119,21 @@ MAX_SPREAD_PCT = _f("MAX_SPREAD_PCT", 3)
 # Option buying: best strike = delta in this band, liquid, tight spread
 BUY_DELTA_MIN = _f("BUY_DELTA_MIN", 0.40)
 BUY_DELTA_MAX = _f("BUY_DELTA_MAX", 0.65)
-OPT_SL_PCT = _f("OPT_SL_PCT", 25)
-OPT_TARGET_PCT = _f("OPT_TARGET_PCT", 40)
+OPT_SL_PCT = _f("OPT_SL_PCT", 25)          # max premium stop, %
+OPT_SL_MIN_PCT = _f("OPT_SL_MIN_PCT", 12)  # min premium stop, % (noise room)
+OPT_RR = _f("OPT_RR", 2.0)                 # premium target = RR x premium risk
+OPT_TARGET_PCT = _f("OPT_TARGET_PCT", 40)  # fallback target if index candles unavailable
+OPT_LAST_ENTRY = os.getenv("OPT_LAST_ENTRY", "14:00")  # theta eats late option buys
+OPT_MIN_ADX = _f("OPT_MIN_ADX", 18)        # index 5-min trend must have strength
+OPT_MIN_ROOM_PCT = _f("OPT_MIN_ROOM_PCT", 0.25)  # skip if OI wall is this close ahead
+# Option swing (positional, index): daily trend setup + farther expiry, slightly ITM
+OPT_SWING_MIN_DTE = _i("OPT_SWING_MIN_DTE", 7)       # pick the first expiry >= 7 days away
+OPT_SWING_DELTA_MIN = _f("OPT_SWING_DELTA_MIN", 0.50)
+OPT_SWING_DELTA_MAX = _f("OPT_SWING_DELTA_MAX", 0.70)
+OPT_SWING_SL_MIN_PCT = _f("OPT_SWING_SL_MIN_PCT", 20)
+OPT_SWING_SL_MAX_PCT = _f("OPT_SWING_SL_MAX_PCT", 40)
+OPT_SWING_RR = _f("OPT_SWING_RR", 2.0)
+OPT_SWING_MAX_DAYS = _i("OPT_SWING_MAX_DAYS", 5)     # time exit, well before expiry
 OPT_BUY_START = os.getenv("OPT_BUY_START", "09:45")   # OI change at 9:20 is mostly noise
 OPT_EXPIRY_CUTOFF = os.getenv("OPT_EXPIRY_CUTOFF", "13:00")  # no new buys on expiry day after this
 OPT_CONFIRM = _b("OPT_CONFIRM")   # OI bias must agree with the index's 5-min price trend

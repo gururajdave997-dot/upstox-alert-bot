@@ -1,5 +1,5 @@
-"""Orchestrator: swing scan (pre-market), intraday 5m, scalping 1m (live feed),
-options buy/sell setups, exit/trailing alerts, Telegram commands, paper trading.
+"""Orchestrator: swing scan (pre-market + post-close), intraday 5m, options intraday buy,
+options swing (positional), option sell setups, exit/trailing alerts, Telegram commands, paper trading.
 Runs as a GitHub Actions job: exits at end of day, or after MAX_RUNTIME_MIN so the
 workflow can start a fresh run (jobs are capped at 6 hours)."""
 import datetime as dt
@@ -18,6 +18,7 @@ import notifier
 import strategy as ST
 import strike_selector as S
 from data_feed import TokenExpired, UpstoxClient
+from indicators import day_change_pct
 from live_feed import LiveFeed
 from positions import Tracker
 from paper_trade import PaperBook
@@ -42,26 +43,36 @@ def fmt(sig, pid):
     k = sig["kind"]
     track = f"\n<i>Tracking #{pid} · /close {pid} if not taken</i>" if pid else ""
     if k == "INTRADAY":
-        return (f"{arrow(sig['direction'])} <b>INTRADAY {s}</b>\n"
+        return (f"{arrow(sig['direction'])} <b>INTRADAY {s}</b> · {sig['setup']}\n"
                 f"Entry ~{sig['entry']} | SL {sig['sl']} | Target {sig['target']} (1:{C.INTRADAY_RR:g})\n"
-                f"EMA{C.EMA_FAST}/{C.EMA_SLOW} cross · Vol {sig['vol_ratio']}x · VWAP ok · "
-                f"{sig['candle']} ({C.CANDLE_MINUTES}m){track}")
-    if k == "SCALP":
-        opt = ""
-        if sig.get("pick"):
-            p = sig["pick"]
-            opt = (f"\nOption: <b>Buy {s} {p['strike']} {p['opt']}</b> ~{p['ltp']} "
-                   f"({html.escape(p['why'])})")
-        return (f"⚡{arrow(sig['direction'])} <b>SCALP {s}</b>\n"
-                f"Entry ~{sig['entry']} | SL {sig['sl']} | Target {sig['target']} (ATR)\n"
-                f"EMA{C.SCALP_EMA_FAST}/{C.SCALP_EMA_SLOW} cross · {sig['note']} · "
-                f"{sig['candle']} (1m){opt}{track}")
+                f"{html.escape(sig['why'])} · Vol {sig['vol_ratio']}x · VWAP ok\n"
+                f"{sig['note']} · {sig['candle']} ({C.CANDLE_MINUTES}m){track}")
     if k == "SWING":
-        what = "breakout above" if sig["direction"] > 0 else "breakdown below"
-        return (f"📅{arrow(sig['direction'])} <b>SWING {s}</b>\n"
-                f"Close {sig['entry']} – {C.SWING_LOOKBACK}-day {what} {sig['level']}\n"
-                f"SL {sig['sl']} ({C.SWING_ATR_SL:g}×ATR) | Target {sig['target']} (1:{C.SWING_RR:g})\n"
-                f"Vol {sig['vol_ratio']}x · {sig['note']}{track}")
+        if sig["setup"] == "BREAKOUT":
+            what = (f"{C.SWING_LOOKBACK}-day {'breakout above' if sig['direction'] > 0 else 'breakdown below'}"
+                    f" {sig['level']}")
+        else:
+            what = f"pullback to 20 EMA ({sig['level']}) and reversal"
+        risk_atr = abs(sig["entry"] - sig["sl"]) / sig["atr"] if sig.get("atr") else 0
+        opt = ""
+        if sig.get("opt_alt"):
+            p = sig["opt_alt"]
+            opt = (f"\nF&O alt: <b>Buy {s} {p['strike']} {p['opt']}</b> ({p['expiry']}) ~{p['ltp']} · "
+                   f"SL {p['sl']} | Tgt {p['target']} · {html.escape(p['why'])}")
+        return (f"📅{arrow(sig['direction'])} <b>SWING {s}</b> · {sig['setup']}\n"
+                f"Close {sig['entry']} – {what}\n"
+                f"SL {sig['sl']} ({risk_atr:.1f}×ATR) | Target {sig['target']} (1:{C.SWING_RR:g})\n"
+                f"Vol {sig['vol_ratio']}x · {sig['note']}{opt}{track}")
+    if k == "OPT_SWING":
+        p = sig["pick"]
+        icon = "📈" if sig["direction"] > 0 else "📉"
+        return (f"{icon}📅 <b>OPTION SWING {s} → BUY {p['strike']} {p['opt']}</b> ({sig['expiry']})\n"
+                f"Premium ~{sig['entry']} | SL {sig['sl']} ({sig['risk_pct']}%) | "
+                f"Target {sig['target']} (1:{C.OPT_SWING_RR:g})\n"
+                f"Index {sig['setup'].lower()} on daily · spot {sig['spot']} · index stop {sig['spot_sl']}\n"
+                f"{sig['note']} · {html.escape(p['why'])}\n"
+                f"<i>Positional: hold up to {C.OPT_SWING_MAX_DAYS} days. Premium shown is the last "
+                f"price – enter near it.</i>{track}")
     ctx = (f"Spot {sig['spot']} · PCR {sig['pcr']} · Support {sig['support']} / "
            f"Resistance {sig['resistance']} · ATM IV {sig['atm_iv']} · Exp {sig['expiry']}")
     if k == "OPT_BUY":
@@ -69,6 +80,7 @@ def fmt(sig, pid):
         icon = "📈" if sig["direction"] > 0 else "📉"
         return (f"{icon} <b>{sig['bias']} {s} → BUY {p['strike']} {p['opt']}</b>\n"
                 f"Premium ~{sig['entry']} | SL {sig['sl']} | Target {sig['target']}\n"
+                f"{sig['plan']} · {sig['note']}\n"
                 f"Best strike: {html.escape(p['why'])}\n"
                 f"ΔOI CE {sig['ce_chg']:,} · PE {sig['pe_chg']:,}\n{ctx}{track}")
     if k == "OPT_SELL":
@@ -110,12 +122,13 @@ class Bot:
         self.tg_offset = None
         self.day = None
         self.idx_bias = {}   # index name -> +1/-1/0 from 5-min trend
+        self.idx_df = {}     # index name -> latest 5-min candles
+        self.idx_chg = {}    # index name -> today's % change
         self.swing_seen_path = os.path.join(C.STATE_DIR, "swing_seen.json")
 
     def reset_day(self, d):
         self.day, self.sent, self.done = d, set(), set()
         self.opt = {"buy": {}, "sell": {}, "iv": {}}
-        self.chains, self.scalp_seen = {}, {}
         self.tracker.drop_stale_intraday(d)
         try:  # carry today's alert memory over from the previous run (no duplicate alerts)
             with open(self.session_path) as f:
@@ -157,23 +170,24 @@ class Bot:
             return
         try:
             k = sig["kind"]
-            if k == "OPT_BUY":
+            if k in ("OPT_BUY", "OPT_SWING"):
                 p = sig.get("pick") or {}
                 ikey = p.get("instrument_key") or p.get("key")
                 name = f"{sig['symbol']} {p.get('strike')} {p.get('opt')}"
-                side, lot, ltp = "BUY", int(p.get("lot_size") or p.get("lot") or 1), sig["entry"]
-            elif k in ("SWING", "INTRADAY") or (k == "SCALP" and ikey not in self.index_keys):
+                side, lot = "BUY", int(p.get("lot_size") or p.get("lot") or 1)
+                ltp = sig["entry"] if k == "OPT_BUY" else None  # option swing: next live price
+            elif k in ("SWING", "INTRADAY"):
                 name, lot = sig["symbol"], 1
                 side = "BUY" if sig["direction"] > 0 else "SELL"
                 live_px = self.live.ltp(ikey) if self.live and k != "SWING" else None
                 ltp = None if k == "SWING" else (live_px or sig["entry"])  # swing: next open
             else:
-                return  # index scalps and hedged option-sell spreads are not paper traded
+                return  # hedged option-sell spreads are not paper traded
             if not ikey:
                 log.warning("Paper: no instrument key for %s, skipped", sig["key"])
                 return
             msg = self.paper.open_trade(k, name, ikey, side, sig["sl"], sig["target"],
-                                        ltp=ltp, lot_size=lot, is_option=(k == "OPT_BUY"), now=now)
+                                        ltp=ltp, lot_size=lot, is_option=k.startswith("OPT"), now=now)
             if msg:
                 notifier.send(msg)
         except Exception as e:
@@ -242,7 +256,7 @@ class Bot:
                 self.send_login("Login link")
             elif cmd == "/help":
                 notifier.send("/login – Upstox login link\n/code XXXX – finish login manually\n/positions – tracked trades\n"
-                              "/close N – stop tracking #N\n/closeall [SWING] – stop tracking all\n/status\n"
+                              "/close N – stop tracking #N\n/closeall [SWING|OPT_SWING] – stop tracking all\n/status\n"
                               "/paper – open paper trades\n/pnl – paper P&L\n"
                               "/paperclose N – remove paper trade #N\n/paperreset – restart paper account")
         if first and self.tg_offset is None:
@@ -286,11 +300,12 @@ class Bot:
 
     def swing_scan(self, now, eod=False):
         n = 0
-        regime = 0
+        regime, nifty = 0, None
         mk = next((k for k, nm in self.indices if nm == C.MARKET_INDEX), None)
         if mk:
             try:
-                regime = ST.daily_regime(self.client.daily(mk, now.date(), include_today=eod))
+                nifty = self.client.daily(mk, now.date(), include_today=eod)
+                regime = ST.daily_regime(nifty)
             except TokenExpired:
                 raise
             except Exception as e:
@@ -301,16 +316,21 @@ class Bot:
         for key, name in self.swings:
             try:
                 sig = ST.swing_signal(self.client.daily(key, now.date(), include_today=eod),
-                                      name, key, regime)
+                                      name, key, regime, nifty)
                 if sig and sig["key"] not in seen:
                     seen[sig["key"]] = now.date().isoformat()
                     n += 1
+                    if C.SWING_OPTION_ALT and sig["direction"] > 0:
+                        sig["opt_alt"] = self.stock_option_alt(key, sig, now)
                     self.emit(sig, now, key)
                 time.sleep(0.2)  # stay well inside Upstox API rate limits on big lists
             except TokenExpired:
                 raise
             except Exception as e:
                 log.warning("Swing %s: %s", name, e)
+        if C.ENABLE_OPTIONS_SWING:
+            n_opt = self.option_swing_scan(now, eod, seen)
+            n += n_opt
         try:
             with open(self.swing_seen_path, "w") as f:
                 json.dump(seen, f)
@@ -321,35 +341,77 @@ class Bot:
         notifier.send(f"📅 {when} swing scan done: {n} setup(s) from {len(self.swings)} stocks "
                       f"({reg}).")
 
-    def scalp_eval(self, key, name, df, now):
-        if df is None or not len(df) or self.scalp_seen.get(key) == df.index[-1]:
-            return
-        self.scalp_seen[key] = df.index[-1]
-        is_idx = key in self.index_keys
-        sig = ST.scalp_signal(df, name, key, is_idx, self.idx_bias.get(C.MARKET_INDEX, 0))
-        if sig and is_idx and name in self.chains:
-            cdf, ctx = self.chains[name]
-            sig["pick"] = S.best_buy(cdf, "CE" if sig["direction"] > 0 else "PE", ctx["spot"])
-        self.emit(sig, now, key)
+    def stock_option_alt(self, key, sig, now):
+        """F&O stocks only: a monthly, slightly-ITM call as an alternative to the cash trade."""
+        try:
+            exp = self.client.expiry_after(key, now.date(), 15)
+            if not exp:
+                return None
+            cdf = S.chain_df(self.client.option_chain(key, exp))
+            if cdf.empty:
+                return None
+            pick = S.best_buy(cdf, "CE", sig["entry"], strict=True,
+                              dmin=C.OPT_SWING_DELTA_MIN, dmax=C.OPT_SWING_DELTA_MAX)
+            if not pick:
+                return None
+            sl, tgt, _ = ST.premium_levels(pick["ltp"], pick["delta"], abs(sig["entry"] - sig["sl"]),
+                                           C.SWING_RR, C.OPT_SWING_SL_MIN_PCT, C.OPT_SWING_SL_MAX_PCT)
+            return {**pick, "expiry": exp, "sl": sl, "target": tgt}
+        except TokenExpired:
+            raise
+        except Exception as e:
+            log.info("No option alt for %s: %s", sig["symbol"], e)  # not an F&O stock
+            return None
+
+    def option_swing_scan(self, now, eod, seen):
+        n = 0
+        for key, name in self.indices:
+            try:
+                sig = ST.index_swing_signal(self.client.daily(key, now.date(), include_today=eod),
+                                            name, key)
+                if not sig:
+                    continue
+                exp = self.client.expiry_after(key, now.date(), C.OPT_SWING_MIN_DTE)
+                if not exp:
+                    continue
+                cdf = S.chain_df(self.client.option_chain(key, exp))
+                if cdf.empty:
+                    continue
+                osig = ST.option_swing_setup(cdf, sig, exp)
+                if not osig or osig["key"] in seen:
+                    continue
+                seen[osig["key"]] = now.date().isoformat()
+                osig["pick"]["lot_size"] = self.client.lots.get(osig["pick"]["key"], 1)
+                n += 1
+                self.emit(osig, now)
+            except TokenExpired:
+                raise
+            except Exception as e:
+                log.warning("Option swing %s: %s", name, e)
+        return n
 
     def scan(self, now):
         entries = between(now, C.ENTRY_START, C.NO_NEW_ENTRY_AFTER)
-        rest_scalp = C.ENABLE_SCALP and not (self.live and self.live.is_live())
         for key, name in self.indices:  # index trend = filter for stocks and option buys
             try:
-                self.idx_bias[name] = ST.trend_bias(self.client.candles(key, C.CANDLE_MINUTES, now))
+                idf = self.client.candles(key, C.CANDLE_MINUTES, now)
+                self.idx_df[name] = idf
+                self.idx_bias[name] = ST.trend_bias(idf)
+                self.idx_chg[name] = day_change_pct(idf) if idf is not None and len(idf) else None
             except TokenExpired:
                 raise
             except Exception as e:
                 log.warning("Bias %s: %s", name, e)
         mkt = self.idx_bias.get(C.MARKET_INDEX, 0)
+        mkt_chg = self.idx_chg.get(C.MARKET_INDEX)
         for key, name in self.stocks:
             try:
                 if C.ENABLE_INTRADAY and entries:
+                    if sum(1 for k in self.sent if k.startswith(f"INTRA-{name}-")) \
+                            >= C.INTRA_MAX_PER_STOCK:
+                        continue  # enough alerts on this stock today
                     self.emit(ST.intraday_signal(self.client.candles(key, C.CANDLE_MINUTES, now),
-                                                 name, key, mkt), now, key)
-                if rest_scalp and entries:
-                    self.scalp_eval(key, name, self.client.candles(key, 1, now), now)
+                                                 name, key, mkt, mkt_chg), now, key)
             except TokenExpired:
                 raise
             except Exception as e:
@@ -364,16 +426,14 @@ class Bot:
                 if cdf.empty:
                     continue
                 ctx = ST.analyse_chain(cdf, name, expiry, key)
-                self.chains[name] = (cdf, ctx)
-                if rest_scalp and entries:
-                    self.scalp_eval(key, name, self.client.candles(key, 1, now), now)
                 late_expiry = expiry == now.date().isoformat() and \
                     now.time() >= T(C.OPT_EXPIRY_CUTOFF)
                 if C.ENABLE_OPTIONS_BUY and entries and not late_expiry \
-                        and now.time() >= T(C.OPT_BUY_START):
+                        and between(now, C.OPT_BUY_START, C.OPT_LAST_ENTRY):
                     prev = self.opt["buy"].get(name)
                     if ctx["bias"] != prev:
-                        sig = ST.options_buy_setup(cdf, ctx, self.idx_bias.get(name, 0))
+                        sig = ST.options_buy_setup(cdf, ctx, self.idx_bias.get(name, 0),
+                                                   self.idx_df.get(name))
                         if sig or ctx["bias"] == "NEUTRAL":
                             self.opt["buy"][name] = ctx["bias"]  # else retry until price agrees
                         if sig:
@@ -395,13 +455,6 @@ class Bot:
     def start_live(self, now):
         keys = [k for k, _ in self.stocks + self.indices]
         self.live = LiveFeed(self.store.get(), keys)
-        for key, _ in self.stocks + self.indices:
-            try:
-                self.live.seed(key, self.client.candles(key, 1, now))
-            except TokenExpired:
-                raise
-            except Exception as e:
-                log.warning("Seed %s: %s", key, e)
         if not self.live.start():
             self.live = None
 
@@ -431,7 +484,7 @@ class Bot:
                 self.live.stop()
                 self.live = None
             return
-        if C.ENABLE_SCALP and "live" not in self.done:
+        if C.ENABLE_LIVE_FEED and "live" not in self.done:
             self.done.add("live")
             self.start_live(now)
         if C.ENABLE_EXIT_ALERTS:
@@ -442,10 +495,6 @@ class Bot:
             self.done.add("sq")
             for m in self.tracker.square_off():
                 notifier.send(m)
-        if C.ENABLE_SCALP and self.live and self.live.is_live() \
-                and between(now, C.ENTRY_START, C.NO_NEW_ENTRY_AFTER):
-            for key, name in self.stocks + self.indices:
-                self.scalp_eval(key, name, self.live.candles(key), now)
         if time.time() - self.last_scan >= C.SCAN_INTERVAL_SEC:
             self.last_scan = time.time()
             self.scan(now)

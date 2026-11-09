@@ -49,17 +49,20 @@ def _why(row):
     return ", ".join(parts)
 
 
-def best_buy(df, opt, spot, strict=False):
-    """Buy: delta ~0.5 (ATM/slightly ITM), high OI+volume, tight spread, premium >= min."""
+def best_buy(df, opt, spot, strict=False, dmin=None, dmax=None):
+    """Buy: delta in band (default ~0.5), high OI+volume, tight spread, premium >= min."""
+    dmin = C.BUY_DELTA_MIN if dmin is None else dmin
+    dmax = C.BUY_DELTA_MAX if dmax is None else dmax
+    mid, half = (dmin + dmax) / 2, max((dmax - dmin) / 2, 0.05)
     c = _cand(df, opt)
-    ok = c[c["delta"].between(C.BUY_DELTA_MIN, C.BUY_DELTA_MAX) & (c["ltp"] >= C.MIN_PREMIUM)
+    ok = c[c["delta"].between(dmin, dmax) & (c["ltp"] >= C.MIN_PREMIUM)
            & (c["spread_pct"].fillna(99) <= C.MAX_SPREAD_PCT)]
     if ok.empty:
         if strict:
             return None  # no liquid strike with a sensible delta: skip the trade
         row = c.loc[(c["strike"] - spot).abs().idxmin()]
         return _pack(row, opt, "ATM (no strike passed delta/liquidity filters)")
-    score = (1 - (ok["delta"] - 0.5).abs() / 0.15) * 0.6 + ok["liq"] * 0.4 \
+    score = (1 - (ok["delta"] - mid).abs() / half) * 0.6 + ok["liq"] * 0.4 \
         - ok["spread_pct"].fillna(0) / 100
     row = ok.loc[score.idxmax()]
     return _pack(row, opt, _why(row))

@@ -1,29 +1,31 @@
-# Tuning update – 29 Oct 2026
+# Update – 9 Nov 2026: scalping removed, intraday / swing / options strengthened
 
-Why paper P&L was negative: intraday/scalp stops were 0.2–0.3% wide, but the paper engine
-charged ~0.3% friction (0.1% cost + slippage, both sides) on positions sized to the full
-capital. Costs were 0.6–2.5R per trade, so even good setups lost money.
+## Removed
+- Scalping (1-min) module, its settings (`ENABLE_SCALP`, `SCALP_*`) and paper-trade type.
+  The live feed now only caches prices for faster exits (`ENABLE_LIVE_FEED`, lighter `ltpc` mode).
+  An old `ENABLE_SCALP` line in BOT_SETTINGS is simply ignored.
 
-## Paper engine (paper_trade.py)
-- Realistic, segment-wise charges: intraday 0.02%, delivery 0.12%, options 0.07% of turnover,
-  plus Rs 20/order brokerage (+GST). Options slippage 0.5% per side (was 0.05%).
-- Skips any trade whose stop is < 3x round-trip cost (PAPER_MIN_R_COST).
-- Swing position value capped at 20% of capital; all open stock trades capped at 100%.
-- Max open per type (PAPER_MAX_OPEN), max 8 intraday-type trades/day, stop after -1.5% day.
-- At +1R: book half, SL to cost + charges, trail the rest by 1R (matches exit alerts).
-- Intraday trades left open overnight are squared off at the next price. Swing time exit 15 days.
-- Option quantity now in real lots (lot size from Upstox contract API).
-- /pnl shows average R per type and unrealised P&L of open trades.
+## Intraday (stocks, 5-min)
+- Three setups instead of one: ORB (15-min opening range breakout, first fresh close, till 11:30,
+  range ≤ 1.2%), PULLBACK (trend resumes after a dip to EMA21/VWAP), CROSS (EMA 9/21, as before).
+- New filters: ADX ≥ 18 (no chop), 15-min trend must agree, RSI not stretched (≤ 72 / ≥ 28),
+  relative strength vs NIFTY today, max 2 alerts per stock per day.
+- Alerts now show the setup, reason, ADX, RSI and RS.
 
-## Signals (strategy.py)
-- Intraday: stop >= 0.4% (from 3-candle swing), skip > 1.5%, no entries after 14:00,
-  must agree with NIFTY 5-min trend, EMA21 must slope the same way, no spike-candle chasing.
-- Scalp (stocks): only if 1-min ATR >= 0.15%, with NIFTY trend; target 2 ATR (was 1.5).
-- Swing: SELL swings off by default (SWING_SHORTS=ON to allow, F&O only); NIFTY 50-DMA regime
-  filter; close in top 40% of day's range; not > 1.5 ATR past breakout; RSI < 78;
-  min Rs 5 cr daily turnover; no duplicate alert from the 15:40 + next 8:30 scans.
-- Option buy: from 09:45; needs index price trend to agree with OI bias; skips if no liquid
-  strike passes filters (no forced ATM pick); no new buys after 13:00 on expiry day.
+## Swing (stocks, daily)
+- New PULLBACK setup: uptrend, dip to 20 EMA within 3 days with RSI cooling to 38–62, then a
+  close above yesterday's high. Stop under the 5-day low, kept between 1 and 2.5 ATR.
+- Relative strength filter: stock must beat NIFTY over 63 days (buy leaders, not laggards).
+- Alert shows distance from 52-week high. F&O stocks get a monthly CE alternative (delta 0.50–0.70).
 
-## New commands
-- /closeall SWING – stop tracking all swing positions.
+## Options intraday buy
+- Index 5-min ADX ≥ 18 required, entries 09:45–14:00 only (theta), skips if an OI wall is
+  within 0.25% ahead.
+- SL/target come from the index's own swing stop mapped through delta (12–25% of premium, 1:2)
+  instead of a flat 25% / 40%.
+
+## Options swing (new, positional)
+- NIFTY/BANKNIFTY daily trend + 20-day breakout or 20 EMA pullback, ADX ≥ 18 → buy a slightly
+  ITM option (delta 0.50–0.70) in the first expiry ≥ 7 days away. SL 20–40% of premium, 1:2,
+  exit after 5 days. Tracked with exit alerts and paper-traded as OPT_SWING.
+- Command: `/closeall OPT_SWING`.

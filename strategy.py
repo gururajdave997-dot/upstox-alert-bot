@@ -1,7 +1,7 @@
-"""Signals: intraday (5m), scalping (1m), swing (daily), options buy & sell setups."""
+"""Signals: intraday (5m), swing (daily), options intraday buy, options swing, option sell setups."""
 import config as C
 import strike_selector as S
-from indicators import atr, ema, rsi, vwap
+from indicators import adx, atr, day_change_pct, ema, resample, rsi, vwap
 
 
 def _cross(f, s):
@@ -46,92 +46,179 @@ def daily_regime(df):
     return 1 if df["close"].iloc[-1] > df["close"].rolling(50).mean().iloc[-1] else -1
 
 
-# ---------- Intraday 5-min: EMA 9/21 cross + volume surge + VWAP side ----------
-def intraday_signal(df, name, key, mkt=0):
+# ---------- Intraday 5-min: ORB / trend PULLBACK / EMA CROSS, with quality filters ----------
+def _orb(df, d_hint=0):
+    """Opening-range breakout: first fresh close beyond the first ORB_MINUTES range."""
+    t = df.index[-1]
+    today = df[df.index.date == t.date()]
+    n = max(1, C.ORB_MINUTES // C.CANDLE_MINUTES)
+    if len(today) <= n or t.hour * 60 + t.minute > _t(C.ORB_LAST_ENTRY):
+        return 0, None
+    rng = today.iloc[:n]
+    hi, lo = float(rng["high"].max()), float(rng["low"].min())
+    if (hi - lo) / lo * 100 > C.ORB_MAX_WIDTH_PCT:
+        return 0, None
+    after = today.iloc[n:]
+    c, pc = float(after["close"].iloc[-1]), float(today["close"].iloc[-2])
+    if c > hi and pc <= hi and (after["close"].iloc[:-1] <= hi).all():
+        return 1, (hi, lo)
+    if c < lo and pc >= lo and (after["close"].iloc[:-1] >= lo).all():
+        return -1, (hi, lo)
+    return 0, None
+
+
+def _pullback(df, e9, e21, vw):
+    """Trend continuation: EMA9 > EMA21 rising, a recent dip into EMA21/VWAP, then a strong
+    candle closing back above the previous high (mirror for shorts)."""
+    last, prev = df.iloc[-1], df.iloc[-2]
+    for d in (1, -1):
+        trend = (e9.iloc[-1] - e21.iloc[-1]) * d > 0 and (e21.iloc[-1] - e21.iloc[-4]) * d > 0
+        if not trend:
+            continue
+        zone = [max(e21.iloc[-i], vw.iloc[-i]) if d > 0 else min(e21.iloc[-i], vw.iloc[-i])
+                for i in (2, 3)]
+        lows = [df["low"].iloc[-2], df["low"].iloc[-3]] if d > 0 else \
+            [df["high"].iloc[-2], df["high"].iloc[-3]]
+        touched = any((lw - z * (1 + d * 0.001)) * d <= 0 for lw, z in zip(lows, zone))
+        resumed = (last["close"] - last["open"]) * d > 0 and \
+            (last["close"] - (prev["high"] if d > 0 else prev["low"])) * d > 0 and \
+            (last["close"] - e9.iloc[-1]) * d > 0
+        if touched and resumed:
+            return d
+    return 0
+
+
+def intraday_signal(df, name, key, mkt=0, mkt_chg=None):
     if df is None or len(df) < C.EMA_SLOW + 22:
         return None
     t = df.index[-1]
     if t.hour * 60 + t.minute > _t(C.INTRA_LAST_ENTRY):
         return None  # too late for a 1:2 target before square-off
-    e9, e21 = ema(df["close"], C.EMA_FAST), ema(df["close"], C.EMA_SLOW)
-    d = _cross(e9, e21)
+    c = df["close"]
+    e9, e21, vw = ema(c, C.EMA_FAST), ema(c, C.EMA_SLOW), vwap(df)
+    setup, d, orb = None, 0, None
+    if "ORB" in C.INTRA_SETUPS:
+        d, orb = _orb(df)
+        setup = "ORB" if d else None
+    if not d and "PULLBACK" in C.INTRA_SETUPS:
+        d = _pullback(df, e9, e21, vw)
+        setup = "PULLBACK" if d else None
+    if not d and "CROSS" in C.INTRA_SETUPS:
+        d = _cross(e9, e21)
+        if d and (e21.iloc[-1] - e21.iloc[-4]) * d <= 0:
+            d = 0  # slow EMA not sloping our way = choppy cross
+        setup = "CROSS" if d else None
     if not d:
         return None
     if C.MARKET_FILTER and mkt and mkt != d:
         return None  # against NIFTY's trend
-    if (e21.iloc[-1] - e21.iloc[-4]) * d <= 0:
-        return None  # slow EMA not sloping our way = choppy cross
     last = df.iloc[-1]
     vavg = df["volume"].rolling(20).mean().shift(1).iloc[-1]
-    if not vavg or last["volume"] < C.VOLUME_MULTIPLIER * vavg:
+    need = C.PULLBACK_VOL_MULT if setup == "PULLBACK" else C.VOLUME_MULTIPLIER
+    if not vavg or last["volume"] < need * vavg:
         return None
-    vw = vwap(df).iloc[-1]
-    if (d > 0 and last["close"] < vw) or (d < 0 and last["close"] > vw):
-        return None
+    if (last["close"] - vw.iloc[-1]) * d < 0:
+        return None  # wrong side of VWAP
     a = float(atr(df).iloc[-1])
     if abs(last["close"] - last["open"]) > C.INTRA_MAX_CANDLE_ATR * a:
         return None  # chasing a spike candle
+    r = float(rsi(c).iloc[-1])
+    if (d > 0 and r > C.INTRA_RSI_MAX) or (d < 0 and r < 100 - C.INTRA_RSI_MAX):
+        return None  # stretched: late entry
+    strength = float(adx(df).iloc[-1])
+    if setup != "ORB" and strength < C.INTRA_MIN_ADX:
+        return None  # no trend: crosses/pullbacks fail in chop
+    if C.INTRA_HTF_FILTER:
+        h = resample(df, 15)
+        if len(h) >= C.EMA_SLOW + 2:
+            h9, h21 = ema(h["close"], C.EMA_FAST).iloc[-1], ema(h["close"], C.EMA_SLOW).iloc[-1]
+            if (h9 - h21) * d < 0:
+                return None  # 15-min trend disagrees
+    chg = day_change_pct(df)
+    if C.INTRA_RS_FILTER and mkt_chg is not None and (chg - mkt_chg) * d < 0:
+        return None  # longs must be stronger than NIFTY today, shorts weaker
     entry = float(last["close"])
     recent = df.tail(3)
     sl = float(recent["low"].min() if d > 0 else recent["high"].max())  # 3-candle swing
     risk = max(abs(entry - sl), a, entry * C.INTRA_MIN_RISK_PCT / 100)
     if risk > entry * C.INTRA_MAX_RISK_PCT / 100:
         return None
+    why = {"ORB": f"{C.ORB_MINUTES}m range {orb[1]:g}-{orb[0]:g} broken" if orb else "ORB",
+           "PULLBACK": f"dip to EMA{C.EMA_SLOW}/VWAP, trend resumed",
+           "CROSS": f"EMA{C.EMA_FAST}/{C.EMA_SLOW} cross"}[setup]
+    rs = f" · RS {chg - mkt_chg:+.1f}% vs NIFTY" if mkt_chg is not None else ""
     return _base("INTRADAY", name, d, entry, entry - d * risk, entry + d * C.INTRADAY_RR * risk,
-                 key, True, vol_ratio=round(float(last["volume"] / vavg), 1),
+                 key, True, setup=setup, why=why, vol_ratio=round(float(last["volume"] / vavg), 1),
+                 note=f"ADX {strength:.0f} · RSI {r:.0f}{rs}",
                  candle=df.index[-1].strftime("%H:%M"),
                  key=f"INTRA-{name}-{d}-{df.index[-1]}")
 
 
-# ---------- Scalping 1-min: EMA 5/13 cross + VWAP/volume (stocks) or RSI (index) ----------
-def scalp_signal(df, name, key, is_index, mkt=0):
-    if df is None or len(df) < 40:
+# ---------- Swing daily: 20-day BREAKOUT or trend PULLBACK to 20 EMA, + RS vs NIFTY ----------
+def _ret(df, n):
+    if df is None or len(df) <= n:
         return None
-    d = _cross(ema(df["close"], C.SCALP_EMA_FAST), ema(df["close"], C.SCALP_EMA_SLOW))
-    if not d:
-        return None
-    last = df.iloc[-1]
-    a = float(atr(df).iloc[-1])
-    if not is_index:
-        if C.MARKET_FILTER and mkt and mkt != d:
-            return None
-        if a / float(last["close"]) * 100 < C.SCALP_MIN_ATR_PCT:
-            return None  # moves too small: costs would eat the target
-    if is_index:
-        r = rsi(df["close"], 14).iloc[-1]
-        if (d > 0 and r < 55) or (d < 0 and r > 45):
-            return None
-        note = f"RSI {r:.0f}"
-    else:
-        vavg = df["volume"].rolling(20).mean().shift(1).iloc[-1]
-        vw = vwap(df).iloc[-1]
-        if not vavg or last["volume"] < C.VOLUME_MULTIPLIER * vavg:
-            return None
-        if (d > 0 and last["close"] < vw) or (d < 0 and last["close"] > vw):
-            return None
-        note = f"Vol {last['volume'] / vavg:.1f}x, {'above' if d > 0 else 'below'} VWAP"
-    entry = float(last["close"])
-    return _base("SCALP", name, d, entry, entry - d * C.SCALP_ATR_SL * a,
-                 entry + d * C.SCALP_ATR_TGT * a, key, True, note=note,
-                 candle=df.index[-1].strftime("%H:%M"), key=f"SCALP-{name}-{d}-{df.index[-1]}")
+    return float(df["close"].iloc[-1] / df["close"].iloc[-1 - n] - 1) * 100
 
 
-# ---------- Swing daily: 20-day breakout/breakdown + volume + 50/200 DMA trend ----------
-def swing_signal(df, name, key, regime=0):
+def swing_signal(df, name, key, regime=0, nifty=None):
     if df is None or len(df) < 60:
         return None
     last, prev = df.iloc[-1], df.iloc[:-1]
+    c = df["close"]
     hh = prev["high"].tail(C.SWING_LOOKBACK).max()
     ll = prev["low"].tail(C.SWING_LOOKBACK).min()
     vavg = prev["volume"].tail(20).mean()
-    d50 = df["close"].rolling(50).mean().iloc[-1]
-    d200 = df["close"].rolling(200).mean().iloc[-1] if len(df) >= 200 else None
-    vol_ok = vavg and last["volume"] >= C.VOLUME_MULTIPLIER * vavg
-    up = last["close"] > hh and last["close"] > d50 and (d200 is None or d50 > d200)
-    dn = last["close"] < ll and last["close"] < d50 and (d200 is None or d50 < d200)
-    if not vol_ok or not (up or dn):
+    sma50 = c.rolling(50).mean()
+    d50 = sma50.iloc[-1]
+    d200 = c.rolling(200).mean().iloc[-1] if len(df) >= 200 else None
+    e20 = ema(c, 20)
+    a = float(atr(df).iloc[-1])
+    rsr = rsi(c)
+    r = float(rsr.iloc[-1])
+    vr = float(last["volume"] / vavg) if vavg else 0
+    rng = float(last["high"] - last["low"]) or 1e-9
+    loc = float(last["close"] - last["low"]) / rng
+    setup, d, level, sl = None, 0, None, None
+    # 1) Breakout / breakdown of the 20-day range on volume, with the trend
+    if "BREAKOUT" in C.SWING_SETUPS and vr >= C.VOLUME_MULTIPLIER:
+        up = last["close"] > hh and last["close"] > d50 and (d200 is None or d50 > d200)
+        dn = last["close"] < ll and last["close"] < d50 and (d200 is None or d50 < d200)
+        if up or dn:
+            d, level = (1, hh) if up else (-1, ll)
+            if abs(last["close"] - level) > C.SWING_MAX_EXT_ATR * a:
+                d = 0  # already ran too far from the breakout level
+            elif (d > 0 and loc < C.SWING_CLOSE_LOC) or (d < 0 and loc > 1 - C.SWING_CLOSE_LOC):
+                d = 0  # weak close: breakout not held into the close
+            elif (d > 0 and r > 78) or (d < 0 and r < 22):
+                d = 0  # exhausted
+            else:
+                setup, sl = "BREAKOUT", float(last["close"]) - d * C.SWING_ATR_SL * a
+    # 2) Pullback: uptrend (close > 50 DMA rising, 50 > 200), dipped to 20 EMA in the last
+    #    3 sessions with RSI cooling to 40-60, today closes above yesterday's high
+    if not d and "PULLBACK" in C.SWING_SETUPS:
+        for dd in (1, -1):
+            trend = (last["close"] - d50) * dd > 0 and (d50 - sma50.iloc[-10]) * dd > 0 and \
+                (d200 is None or (d50 - d200) * dd > 0) and (e20.iloc[-1] - d50) * dd > 0
+            if not trend:
+                continue
+            ext = df["low"].iloc[-4:-1] if dd > 0 else df["high"].iloc[-4:-1]
+            touched = ((ext - (e20.iloc[-4:-1] + dd * 0.25 * a)) * dd <= 0).any()
+            cooled = rsr.iloc[-4:-1].between(38, 62).any()  # momentum reset, not a collapse
+            turn = (last["close"] - (prev["high"].iloc[-1] if dd > 0 else prev["low"].iloc[-1])) * dd > 0 \
+                and (last["close"] - last["open"]) * dd > 0 and (last["close"] - e20.iloc[-1]) * dd > 0
+            vol_ok = vr >= 1.0
+            if touched and cooled and turn and vol_ok:
+                d, setup = dd, "PULLBACK"
+                swing = float(df["low"].tail(5).min() if dd > 0 else df["high"].tail(5).max())
+                sl = swing - dd * 0.25 * a
+                risk = abs(float(last["close"]) - sl)
+                risk = min(max(risk, 1.0 * a), 2.5 * a)  # keep stop between 1 and 2.5 ATR
+                sl = float(last["close"]) - dd * risk
+                level = float(e20.iloc[-1])
+                break
+    if not d:
         return None
-    d = 1 if up else -1
     if d < 0 and not C.SWING_SHORTS:
         return None  # cash shares cannot be held short overnight
     if C.SWING_REGIME_FILTER and regime and regime != d:
@@ -139,26 +226,74 @@ def swing_signal(df, name, key, regime=0):
     turnover_cr = float((prev["close"] * prev["volume"]).tail(20).mean()) / 1e7
     if turnover_cr < C.SWING_MIN_TURNOVER_CR:
         return None  # illiquid: slippage and gaps hurt
+    rs_txt = ""
+    sr, nr = _ret(df, C.SWING_RS_DAYS), _ret(nifty, C.SWING_RS_DAYS)
+    if sr is not None and nr is not None:
+        if C.SWING_RS_FILTER and (sr - nr) * d < 0:
+            return None  # laggard: buy leaders, not laggards
+        rs_txt = f" · RS {sr - nr:+.0f}% vs NIFTY ({C.SWING_RS_DAYS}d)"
+    entry = float(last["close"])
+    risk = abs(entry - sl)
+    hi52 = float(df["high"].tail(250).max())
+    near_high = f" · {(1 - entry / hi52) * 100:.0f}% below 52w high" if d > 0 else ""
+    trend = "50>200 DMA" if d200 is not None else "above 50 DMA"
+    if d < 0:
+        trend = trend.replace(">", "<").replace("above", "below")
+    return _base("SWING", name, d, entry, entry - d * risk, entry + d * C.SWING_RR * risk, key,
+                 False, setup=setup, level=round(float(level), 2), vol_ratio=round(vr, 1),
+                 atr=round(a, 2),
+                 note=f"{trend} · RSI {r:.0f}{rs_txt}{near_high}",
+                 key=f"SWING-{name}-{d}-{df.index[-1].date()}")
+
+
+# ---------- Index daily trend setup (for positional option buys) ----------
+def index_swing_signal(df, name, key):
+    """Daily NIFTY/BANKNIFTY: trend (close > 20 EMA > 50 DMA, 20 EMA rising, ADX >= 18) + a
+    20-day breakout or a dip-to-20-EMA reversal. Mirror for downtrends (buy PE)."""
+    if df is None or len(df) < 60:
+        return None
+    c = df["close"]
+    last, prev = df.iloc[-1], df.iloc[:-1]
+    e20, s50 = ema(c, 20), c.rolling(50).mean()
     a = float(atr(df).iloc[-1])
-    level = hh if up else ll
-    if abs(last["close"] - level) > C.SWING_MAX_EXT_ATR * a:
-        return None  # already ran too far from the breakout level
+    rsr = rsi(c)
+    r = float(rsr.iloc[-1])
+    strength = float(adx(df).iloc[-1])
+    if strength < 18:
+        return None  # flat market: bought options bleed theta
     rng = float(last["high"] - last["low"]) or 1e-9
     loc = float(last["close"] - last["low"]) / rng
-    if (d > 0 and loc < C.SWING_CLOSE_LOC) or (d < 0 and loc > 1 - C.SWING_CLOSE_LOC):
-        return None  # weak close: breakout not held into the close
-    r = float(rsi(df["close"]).iloc[-1])
-    if (d > 0 and r > 78) or (d < 0 and r < 22):
-        return None  # exhausted
-    entry = float(last["close"])
-    risk = C.SWING_ATR_SL * a
-    trend = "50>200 DMA" if d200 is not None else "above 50 DMA"
-    return _base("SWING", name, d, entry, entry - d * risk, entry + d * C.SWING_RR * risk, key,
-                 False, level=round(float(level), 2),
-                 vol_ratio=round(float(last["volume"] / vavg), 1),
-                 note=(trend if up else trend.replace(">", "<").replace("above", "below"))
-                 + f" · RSI {r:.0f}",
-                 key=f"SWING-{name}-{d}-{df.index[-1].date()}")
+    for d in (1, -1):
+        trend = (last["close"] - e20.iloc[-1]) * d > 0 and (e20.iloc[-1] - s50.iloc[-1]) * d > 0 \
+            and (e20.iloc[-1] - e20.iloc[-5]) * d > 0
+        if not trend or (d > 0 and r > 75) or (d < 0 and r < 25):
+            continue
+        lvl = prev["high"].tail(20).max() if d > 0 else prev["low"].tail(20).min()
+        brk = (last["close"] - lvl) * d > 0 and abs(last["close"] - lvl) <= 1.0 * a and \
+            (loc >= 0.6 if d > 0 else loc <= 0.4)
+        ext = df["low"].iloc[-4:-1] if d > 0 else df["high"].iloc[-4:-1]
+        dip = ((ext - (e20.iloc[-4:-1] + d * 0.25 * a)) * d <= 0).any() and \
+            rsr.iloc[-4:-1].between(38, 62).any()
+        turn = (last["close"] - (prev["high"].iloc[-1] if d > 0 else prev["low"].iloc[-1])) * d > 0 \
+            and (last["close"] - last["open"]) * d > 0
+        setup = "BREAKOUT" if brk else ("PULLBACK" if dip and turn else None)
+        if not setup:
+            continue
+        swing = float(df["low"].tail(3).min() if d > 0 else df["high"].tail(3).max())
+        risk = abs(float(last["close"]) - (swing - d * 0.25 * a))
+        risk = min(max(risk, 1.0 * a), 2.5 * a)
+        return {"symbol": name, "underlying": key, "direction": d, "setup": setup,
+                "spot": round(float(last["close"]), 2), "spot_risk": round(risk, 2),
+                "spot_sl": round(float(last["close"]) - d * risk, 2), "atr": round(a, 2),
+                "note": f"ADX {strength:.0f} · RSI {r:.0f}", "date": str(df.index[-1].date())}
+    return None
+
+
+def premium_levels(ltp, delta, spot_risk, rr, lo_pct, hi_pct):
+    """Map an underlying stop to option premium via delta; clamp to sane % bands."""
+    risk = (delta or 0.5) * spot_risk
+    risk = min(max(risk, ltp * lo_pct / 100), ltp * hi_pct / 100)
+    return round(ltp - risk, 2), round(ltp + rr * risk, 2), round(risk / ltp * 100)
 
 
 # ---------- Options chain analysis ----------
@@ -188,20 +323,60 @@ def analyse_chain(df, name, expiry, underlying_key):
             "atm": int(atm["strike"]), "atm_iv": round(sum(ivs) / len(ivs), 2) if ivs else 0}
 
 
-def options_buy_setup(df, ctx, spot_trend=0):
+def options_buy_setup(df, ctx, spot_trend=0, idx_df=None):
+    """Intraday option buy: OI bias + index 5-min trend (with ADX strength) agree, room to the
+    next OI wall, liquid strike. SL/target from the index's own structure, mapped by delta."""
     if ctx["bias"] == "NEUTRAL":
         return None
     d = 1 if ctx["bias"] == "BULLISH" else -1
     if C.OPT_CONFIRM and spot_trend != d:
         return None  # OI says one thing, price is not moving that way yet
+    strength, spot_risk = None, None
+    if idx_df is not None and len(idx_df) > C.EMA_SLOW + 5:
+        strength = float(adx(idx_df).iloc[-1])
+        if C.OPT_CONFIRM and strength < C.OPT_MIN_ADX:
+            return None  # sideways index: premium decays while you wait
+        a = float(atr(idx_df).iloc[-1])
+        rec = idx_df.tail(3)
+        swing = float(rec["low"].min() if d > 0 else rec["high"].max())
+        spot_risk = max(abs(ctx["spot"] - swing), a)
+    wall = ctx["resistance"] if d > 0 else ctx["support"]
+    room = (wall - ctx["spot"]) / ctx["spot"] * 100 * d
+    if 0 < room < C.OPT_MIN_ROOM_PCT:
+        return None  # big OI wall just ahead: little room to run
     pick = S.best_buy(df, "CE" if d > 0 else "PE", ctx["spot"], strict=True)
     if not pick or pick["ltp"] <= 0:
         return None
     ltp = pick["ltp"]
+    if spot_risk:
+        sl, tgt, risk_pct = premium_levels(ltp, pick["delta"], spot_risk, C.OPT_RR,
+                                           C.OPT_SL_MIN_PCT, C.OPT_SL_PCT)
+        plan = f"SL {risk_pct}% (index stop {round(ctx['spot'] - d * spot_risk, 1)}) · 1:{C.OPT_RR:g}"
+    else:
+        sl, tgt = round(ltp * (1 - C.OPT_SL_PCT / 100), 2), round(ltp * (1 + C.OPT_TARGET_PCT / 100), 2)
+        plan = f"SL {C.OPT_SL_PCT:g}% · target {C.OPT_TARGET_PCT:g}%"
+    extra = f"ADX {strength:.0f} · " if strength is not None else ""
+    room_txt = f"room to OI wall {wall}: {room:.2f}%" if room > 0 else f"spot beyond OI wall {wall}"
     return {**ctx, "kind": "OPT_BUY", "direction": d, "fav": 1, "mode": "price", "pick": pick,
-            "entry": ltp, "sl": round(ltp * (1 - C.OPT_SL_PCT / 100), 2),
-            "target": round(ltp * (1 + C.OPT_TARGET_PCT / 100), 2), "watch_key": pick["key"],
-            "intraday": True, "key": f"OB-{ctx['symbol']}-{pick['strike']}{pick['opt']}"}
+            "entry": ltp, "sl": sl, "target": tgt, "watch_key": pick["key"], "plan": plan,
+            "note": extra + room_txt, "intraday": True,
+            "key": f"OB-{ctx['symbol']}-{pick['strike']}{pick['opt']}"}
+
+
+def option_swing_setup(cdf, sig, expiry):
+    """Positional option buy for an index daily setup: slightly ITM, farther expiry."""
+    d = sig["direction"]
+    pick = S.best_buy(cdf, "CE" if d > 0 else "PE", sig["spot"], strict=True,
+                      dmin=C.OPT_SWING_DELTA_MIN, dmax=C.OPT_SWING_DELTA_MAX)
+    if not pick or pick["ltp"] <= 0:
+        return None
+    ltp = pick["ltp"]
+    sl, tgt, risk_pct = premium_levels(ltp, pick["delta"], sig["spot_risk"], C.OPT_SWING_RR,
+                                       C.OPT_SWING_SL_MIN_PCT, C.OPT_SWING_SL_MAX_PCT)
+    return {**sig, "kind": "OPT_SWING", "fav": 1, "mode": "price", "pick": pick,
+            "expiry": expiry, "entry": ltp, "sl": sl, "target": tgt, "risk_pct": risk_pct,
+            "watch_key": pick["key"], "intraday": False,
+            "key": f"OSW-{sig['symbol']}-{d}-{sig['date']}"}
 
 
 def options_sell_setup(df, ctx):

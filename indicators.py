@@ -28,3 +28,33 @@ def vwap(df):
     pv = (tp * df["volume"]).groupby(day).cumsum()
     v = df["volume"].groupby(day).cumsum()
     return pv / v.replace(0, np.nan)
+
+
+def adx(df, n=14):
+    """Trend strength (0-100). Above ~20 = trending, below = choppy."""
+    up, dn = df["high"].diff(), -df["low"].diff()
+    pdm = up.where((up > dn) & (up > 0), 0.0)
+    mdm = dn.where((dn > up) & (dn > 0), 0.0)
+    a = atr(df, n).replace(0, np.nan)
+    pdi = 100 * pdm.ewm(alpha=1 / n, adjust=False).mean() / a
+    mdi = 100 * mdm.ewm(alpha=1 / n, adjust=False).mean() / a
+    dx = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
+    return dx.ewm(alpha=1 / n, adjust=False).mean().fillna(0)
+
+
+def day_change_pct(df):
+    """Today's % change vs the previous session's last close (intraday candles)."""
+    if df is None or len(df) < 2:
+        return 0.0
+    dates = df.index.date
+    today = dates[-1]
+    prev = df[dates < today]
+    if prev.empty:
+        return 0.0
+    return (float(df["close"].iloc[-1]) / float(prev["close"].iloc[-1]) - 1) * 100
+
+
+def resample(df, minutes):
+    return df.resample(f"{minutes}min", label="left", closed="left").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last",
+         "volume": "sum"}).dropna(subset=["close"])

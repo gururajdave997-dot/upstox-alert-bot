@@ -60,7 +60,7 @@ class Tracker:
         pid = str(self.next_id)
         self.next_id += 1
         label = sig.get("strategy") or (
-            f"{sig['pick']['strike']} {sig['pick']['opt']} BUY" if sig["kind"] == "OPT_BUY"
+            f"{sig['pick']['strike']} {sig['pick']['opt']} BUY" if sig.get("pick")
             else f"{sig['kind']} {sig['side']}")
         self.pos[pid] = {
             "id": pid, "kind": sig["kind"], "symbol": sig["symbol"], "label": label,
@@ -106,8 +106,9 @@ class Tracker:
             f, lab = p["fav"], self._label(p)
             if not p["intraday"]:
                 age = (dt.date.today() - dt.date.fromisoformat(p["opened"][:10])).days
-                if age >= C.SWING_MAX_DAYS:
-                    msgs.append(f"⌛ <b>EXIT {lab}</b> – no result in {C.SWING_MAX_DAYS} days "
+                limit = C.OPT_SWING_MAX_DAYS if p["kind"] == "OPT_SWING" else C.SWING_MAX_DAYS
+                if age >= limit:
+                    msgs.append(f"⌛ <b>EXIT {lab}</b> – no result in {limit} days "
                                 f"@ {v} ({self._pnl(p, v)}). Free the capital.")
                     del self.pos[pid]
                     continue

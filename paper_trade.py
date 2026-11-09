@@ -14,12 +14,13 @@ Settings (add to BOT_SETTINGS, one per line):
   PAPER_BROKERAGE=20             Rs per order (x2 per trade, + 18% GST)
   PAPER_MAX_NOTIONAL_PCT=20      max position value per SWING trade, % of capital
   PAPER_MAX_EXPOSURE_PCT=100     max value of all open stock trades, % of capital
-  PAPER_MAX_OPEN=SWING:8,INTRADAY:3,SCALP:2,OPT_BUY:2   open trades allowed per type
-  PAPER_MAX_TRADES_DAY=8         new intraday/scalp/option trades per day
+  PAPER_MAX_OPEN=SWING:8,INTRADAY:3,OPT_BUY:2,OPT_SWING:2   open trades allowed per type
+  PAPER_MAX_TRADES_DAY=8         new intraday/option-intraday trades per day
   PAPER_DAILY_LOSS_PCT=1.5       stop new intraday-type trades after this day loss
   PAPER_MIN_R_COST=3             stop distance must be >= 3x the round-trip cost
   PAPER_PARTIAL=ON               book half at 1R, trail the rest
   SWING_MAX_DAYS=15              time exit for swing trades (calendar days)
+  OPT_SWING_MAX_DAYS=5           time exit for positional option trades
   TRAIL_R=1                      trail distance in R after 1R
 """
 import json, os
@@ -30,6 +31,7 @@ IST = ZoneInfo("Asia/Kolkata")
 LEDGER_FILE = "paper_trades.json"
 MARKET_OPEN = time(9, 15)
 SQUARE_OFF = time(15, 15)
+POSITIONAL = ("SWING", "OPT_SWING")   # held overnight; everything else is intraday
 
 
 def _settings():
@@ -47,7 +49,8 @@ def _settings():
     except Exception:
         pass
     for k, v in os.environ.items():
-        if (k.startswith("PAPER_") or k in ("SWING_MAX_DAYS", "TRAIL_R")) and k not in s:
+        if (k.startswith("PAPER_") or k in ("SWING_MAX_DAYS", "OPT_SWING_MAX_DAYS", "TRAIL_R")) \
+                and k not in s:
             s[k] = v
     return s
 
@@ -62,13 +65,13 @@ class PaperBook:
         self.slip_pct = g("PAPER_SLIPPAGE_PCT", 0.05)
         self.opt_slip_pct = g("PAPER_OPT_SLIPPAGE_PCT", 0.5)
         self.cost = {"INTRADAY": g("PAPER_COST_INTRADAY_PCT", 0.02),
-                     "SCALP": g("PAPER_COST_INTRADAY_PCT", 0.02),
                      "SWING": g("PAPER_COST_DELIVERY_PCT", 0.12),
-                     "OPT_BUY": g("PAPER_COST_OPTION_PCT", 0.07)}
+                     "OPT_BUY": g("PAPER_COST_OPTION_PCT", 0.07),
+                     "OPT_SWING": g("PAPER_COST_OPTION_PCT", 0.07)}
         self.brokerage = g("PAPER_BROKERAGE", 20) * 2 * 1.18
         self.max_notional_pct = g("PAPER_MAX_NOTIONAL_PCT", 20)
         self.max_exposure_pct = g("PAPER_MAX_EXPOSURE_PCT", 100)
-        self.max_open = {"SWING": 8, "INTRADAY": 3, "SCALP": 2, "OPT_BUY": 2}
+        self.max_open = {"SWING": 8, "INTRADAY": 3, "OPT_BUY": 2, "OPT_SWING": 2}
         for part in cfg.get("PAPER_MAX_OPEN", "").split(","):
             k, _, v = part.partition(":")
             if k.strip() and v.strip():
@@ -78,6 +81,7 @@ class PaperBook:
         self.min_r_cost = g("PAPER_MIN_R_COST", 3)
         self.partial = cfg.get("PAPER_PARTIAL", "ON").upper() == "ON"
         self.swing_days = int(g("SWING_MAX_DAYS", 15))
+        self.opt_swing_days = int(g("OPT_SWING_MAX_DAYS", 5))
         self.trail_r = g("TRAIL_R", 1)
         self.square_off = square_off
         self.path = path
@@ -115,14 +119,14 @@ class PaperBook:
         n_open = sum(1 for t in self.data["open"] if t["kind"] == kind)
         if n_open >= self.max_open.get(kind, 99):
             return f"{n_open} {kind} trades already open"
-        if kind == "SWING":
+        if kind in POSITIONAL:
             return None
         today = self._today_closed(now)
         opened_today = [t for t in self.data["open"] + self.data["closed"]
-                        if t["kind"] != "SWING" and t["alerted"][:10] == now.date().isoformat()]
+                        if t["kind"] not in POSITIONAL and t["alerted"][:10] == now.date().isoformat()]
         if len(opened_today) >= self.max_trades_day:
             return f"{self.max_trades_day} intraday-type trades already taken today"
-        day_net = sum(r["net"] for r in today if r["kind"] != "SWING")
+        day_net = sum(r["net"] for r in today if r["kind"] not in POSITIONAL)
         if day_net <= -self.data["capital"] * self.daily_loss_pct / 100:
             return f"daily loss limit hit (Rs {day_net:,.0f})"
         return None
@@ -224,12 +228,13 @@ class PaperBook:
                 reason = "trailing SL hit" if (t["sl"] - t["entry"]) * f >= 0 else "SL hit"
             elif (ltp - t["target"]) * f >= 0:
                 reason = "Target hit"
-            elif t["kind"] != "SWING" and (now.time() >= self.square_off
-                                           or opened_day < now.date().isoformat()):
+            elif t["kind"] not in POSITIONAL and (now.time() >= self.square_off
+                                                  or opened_day < now.date().isoformat()):
                 reason = "square-off"
-            elif t["kind"] == "SWING" and (now.date() - datetime.fromisoformat(
-                    t["opened"]).date()).days >= self.swing_days:
-                reason = f"time exit ({self.swing_days} days)"
+            elif t["kind"] in POSITIONAL:
+                days = self.opt_swing_days if t["kind"] == "OPT_SWING" else self.swing_days
+                if (now.date() - datetime.fromisoformat(t["opened"]).date()).days >= days:
+                    reason = f"time exit ({days} days)"
             if reason:
                 msgs.append(self._close(t, ltp, reason, now))
         if msgs:
@@ -307,7 +312,7 @@ class PaperBook:
         lines = ["📊 Paper trading P&L",
                  f"Today: {stats([r for r in closed if r['closed'].startswith(today)])}",
                  f"Overall: {stats(closed)}"]
-        for kind in ("SWING", "INTRADAY", "SCALP", "OPT_BUY"):
+        for kind in ("SWING", "INTRADAY", "OPT_BUY", "OPT_SWING"):
             rows = [r for r in closed if r["kind"] == kind]
             if rows:
                 lines.append(f"  {kind}: {stats(rows)}")

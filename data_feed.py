@@ -100,8 +100,9 @@ class UpstoxClient:
         out = pd.concat([df, row])
         return out[~out.index.duplicated(keep="last")].sort_index()
 
-    def nearest_expiry(self, key, today):
-        k = ("exp", key, today)
+    def expiries(self, key, today):
+        """All future expiries (sorted). Also records lot sizes of every contract."""
+        k = ("exps", key, today)
         if k not in self._cache:
             data = self._get("/v2/option/contract", {"instrument_key": key}) or []
             for c in data:
@@ -110,8 +111,18 @@ class UpstoxClient:
             exps = sorted({c["expiry"] for c in data if c.get("expiry", "") >= today.isoformat()})
             if not exps:
                 raise RuntimeError(f"No expiries found for {key}")
-            self._cache[k] = exps[0]
+            self._cache[k] = exps
         return self._cache[k]
+
+    def nearest_expiry(self, key, today):
+        return self.expiries(key, today)[0]
+
+    def expiry_after(self, key, today, min_days):
+        """First expiry at least min_days away (for positional option trades)."""
+        for e in self.expiries(key, today):
+            if (dt.date.fromisoformat(e) - today).days >= min_days:
+                return e
+        return None
 
     def option_chain(self, key, expiry):
         return self._get("/v2/option/chain", {"instrument_key": key, "expiry_date": expiry}) or []
